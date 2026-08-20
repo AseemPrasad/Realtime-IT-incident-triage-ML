@@ -1,0 +1,1826 @@
+# Real-Time Multimodal IT Incident Triaging & Root-Cause Engine
+Technical Documentation and Architecture Manual
+
+## 1. Executive Summary & System Architecture
+
+### Overview
+This project implements a CPU-first incident triage engine that combines two distinct signals:
+
+- A numerical telemetry stream for anomaly detection and severity scoring.
+- A structured log analysis path for root-cause extraction and incident classification.
+
+The system is designed for resource-constrained x86 environments, specifically an AMD Ryzen 3 class machine with 4 cores, 8 threads, and 15 GB RAM. The implementation philosophy is:
+
+- Keep online inference lightweight.
+- Use notebook environments for experimentation.
+- Move reusable logic into production modules.
+- Prefer calibrated tabular models and small language models over large, latency-heavy stacks.
+- Enforce strict structured outputs from the log side.
+- Fuse both modalities into a deterministic triage decision.
+
+The repository now reflects that design through:
+
+- Telemetry feature extraction and tabular modeling in [`incident_triage/telemetry.py`](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\incident_triage\telemetry.py) and [`incident_triage/tabular_model.py`](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\incident_triage\tabular_model.py)
+- HDFS log target generation and JSON parsing in [`incident_triage/logs.py`](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\incident_triage\logs.py)
+- Fusion logic in [`incident_triage/fusion.py`](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\incident_triage\fusion.py)
+- API serving in [`incident_triage/api/main.py`](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\incident_triage\api\main.py)
+
+### ASCII Architecture Flowchart
+```text
+┌──────────────────────────────────────────────────────────────┐
+│                 Incident Payload / Live Event                │
+│  { telemetry_values, timestamps?, log_content?, asset_id? }  │
+└───────────────────────────────┬──────────────────────────────┘
+                                │
+                 ┌──────────────┴───────────────┐
+                 │                              │
+                 ▼                              ▼
+┌───────────────────────────┐       ┌───────────────────────────┐
+│ Telemetry Feature Extractor│       │   Log Prompt / Parser     │
+│ - rolling mean/std/min/max │       │ - HDFS heuristic labels   │
+│ - EWMA spans               │       │ - prompt formatting       │
+│ - FFT energy               │       │ - JSON extraction         │
+│ - derivatives / z-scores   │       │ - schema validation       │
+└──────────────┬────────────┘       └──────────────┬────────────┘
+               │                                   │
+               ▼                                   ▼
+┌───────────────────────────┐       ┌───────────────────────────┐
+│ Calibrated Tabular Model   │       │   Small Language Model    │
+│ LightGBM or fallback RF    │       │ SmolLM2-class LoRA model  │
+│ outputs anomaly probability│       │ outputs structured JSON   │
+└──────────────┬────────────┘       └──────────────┬────────────┘
+               │                                   │
+               └──────────────┬────────────────────┘
+                              ▼
+                 ┌───────────────────────────────┐
+                 │   Fusion and Decision Layer   │
+                 │ - weighted score              │
+                 │ - severity mapping            │
+                 │ - priority routing            │
+                 └──────────────┬────────────────┘
+                                ▼
+                 ┌───────────────────────────────┐
+                 │ FastAPI /api/v1/triage        │
+                 │ health checks, JSON response   │
+                 └───────────────────────────────┘
+```
+
+### System Constraints & CPU Optimization
+The design assumes limited compute, so each component is intentionally bounded:
+
+- Telemetry inference must be fast enough for near-real-time scoring on CPU.
+- Log parsing should produce valid JSON even when the model output is noisy.
+- The SLM is kept small, LoRA-adapted, and CPU-friendly.
+- Training uses modest batch sizes and gradient accumulation.
+- The API avoids heavyweight orchestration and loads artifacts lazily.
+- The code path must remain deterministic, inspectable, and reproducible.
+
+The current implementation reflects these constraints through:
+
+- Compact feature engineering instead of large deep architectures.
+- Probability calibration to make scores operationally meaningful.
+- A heuristic fallback for log analysis when the trained SLM is unavailable.
+- Pure Python packaging with a minimal FastAPI runtime.
+
+---
+
+## 2. Telemetry Feature Engineering & Math Foundations
+
+### Signal Processing & Feature Transformations
+The telemetry dataset in [`data/cpu_utilization_asg_misconfiguration.csv`](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\data\cpu_utilization_asg_misconfiguration.csv) contains a single time series:
+
+- `timestamp`
+- `value`
+
+The project’s telemetry path converts raw values into a feature vector suitable for anomaly detection. The feature generator is implemented in [`incident_triage/telemetry.py`](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\incident_triage\telemetry.py).
+
+The core transforms are:
+
+1. Rolling window statistics
+2. Exponentially weighted moving averages
+3. Frequency-domain energy via FFT
+4. First-order change features
+5. Normalized deviation features
+
+Let \( x_t \) denote telemetry at time step \( t \).
+
+#### Rolling statistics
+For a window size \( w \), define:
+
+\[
+\mu_t^{(w)} = \frac{1}{w} \sum_{i=t-w+1}^{t} x_i
+\]
+
+\[
+\sigma_t^{(w)} = \sqrt{\frac{1}{w} \sum_{i=t-w+1}^{t} (x_i - \mu_t^{(w)})^2}
+\]
+
+\[
+\min_t^{(w)} = \min(x_{t-w+1}, \dots, x_t)
+\]
+
+\[
+\max_t^{(w)} = \max(x_{t-w+1}, \dots, x_t)
+\]
+
+The implementation computes these over multiple windows, currently:
+
+- 5
+- 15
+- 60
+
+This gives the model both short-horizon and medium-horizon context.
+
+#### EWMA
+For smoothing span \( s \), the exponentially weighted moving average is:
+
+\[
+\text{EWMA}_t^{(s)} = \alpha x_t + (1-\alpha)\text{EWMA}_{t-1}^{(s)}
+\]
+
+with:
+
+\[
+\alpha = \frac{2}{s+1}
+\]
+
+The code computes EWMA for spans 5 and 20, then adds:
+
+\[
+\Delta_t = \text{EWMA}_t^{(5)} - \text{EWMA}_t^{(20)}
+\]
+
+This captures fast deviation from longer-term baseline drift.
+
+#### FFT energy
+For a windowed signal segment \( \mathbf{x} \in \mathbb{R}^n \), the discrete Fourier transform is:
+
+\[
+X_k = \sum_{j=0}^{n-1} x_j e^{-2\pi i kj/n}
+\]
+
+Spectral energy is approximated as:
+
+\[
+E = \frac{1}{n}\sum_{k=0}^{n-1} |X_k|^2
+\]
+
+The project uses FFT energy to detect periodic anomalies, bursts, and oscillatory instability.
+
+#### Differential features
+The code also includes:
+
+\[
+\Delta x_t = x_t - x_{t-1}
+\]
+
+\[
+\text{pct\_change}_t = \frac{x_t - x_{t-1}}{|x_{t-1}|}
+\]
+
+and z-score style normalization over local windows:
+
+\[
+z_t^{(w)} = \frac{x_t - \mu_t^{(w)}}{\sigma_t^{(w)} + \epsilon}
+\]
+
+These features improve sensitivity to spike-like anomalies.
+
+### Tabular Modeling
+The tabular model pipeline is implemented in [`incident_triage/tabular_model.py`](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\incident_triage\tabular_model.py).
+
+The modeling strategy is:
+
+- Use LightGBM if available.
+- Fall back to a balanced Random Forest if LightGBM is not installed.
+- Calibrate output probabilities.
+- Choose an operational threshold from validation data.
+
+Let the model output \( p_t \in [0,1] \) be the probability of anomaly.
+
+The operational decision rule is:
+
+\[
+\hat{y}_t = \mathbb{1}(p_t \ge \tau)
+\]
+
+where \( \tau \) is selected by maximizing F1 over a validation window.
+
+The training path in [`incident_triage/train_tabular.py`](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\incident_triage\train_tabular.py) also adds a label strategy:
+
+- The known incident window is marked anomalous.
+- Very high CPU values are also marked anomalous.
+
+This is appropriate for a CPU-limited baseline system where the goal is high-signal triage rather than perfect ground-truth anomaly annotation.
+
+#### Reference implementation snippet
+```python
+for window in self.config.window_sizes:
+    rolling = series.rolling(window=window, min_periods=1)
+    mean = rolling.mean()
+    std = rolling.std().fillna(0.0)
+    min_ = rolling.min()
+    max_ = rolling.max()
+    out[f"rolling_mean_{window}"] = mean
+    out[f"rolling_std_{window}"] = std
+    out[f"rolling_min_{window}"] = min_
+    out[f"rolling_max_{window}"] = max_
+    out[f"rolling_range_{window}"] = max_ - min_
+    out[f"value_minus_mean_{window}"] = series - mean
+    out[f"zscore_{window}"] = np.where(std > 0, (series - mean) / std, 0.0)
+```
+
+---
+
+## 3. SLM Fine-Tuning & Quantization Pipeline
+
+### Base Model Choice
+The notebook prototype in [`notebooks/02_slm_lora_ssanity_check.ipynb`](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\notebooks\02_slm_lora_ssanity_check.ipynb) uses:
+
+- `HuggingFaceTB/SmolLM2-135M-Instruct`
+
+The blueprint also allows:
+
+- `Qwen/Qwen2.5-0.5B-Instruct`
+
+For the constraints of this machine, the smaller instruction-tuned model is the more practical choice. The reasons are:
+
+- Lower memory footprint
+- Faster CPU adaptation
+- Smaller adapter storage
+- Less risk of OOM during training
+
+### PEFT / LoRA Hyperparameters
+The notebook and production training path use a low-rank adaptation strategy.
+
+The adapted modules are:
+
+- `q_proj`
+- `v_proj`
+
+The configured hyperparameters are:
+
+- Rank \( r = 8 \)
+- LoRA alpha \( \alpha = 16 \)
+- Dropout \( 0.05 \)
+- Bias: none
+
+This means only a small fraction of the base model parameters are trainable.
+
+Conceptually, for a base weight matrix \( W \), LoRA learns:
+
+\[
+W' = W + \frac{\alpha}{r}BA
+\]
+
+where:
+
+- \( A \in \mathbb{R}^{r \times d_{in}} \)
+- \( B \in \mathbb{R}^{d_{out} \times r} \)
+
+### CPU Training Configuration
+The notebook uses CPU-oriented training with conservative settings.
+
+The implemented training profile is:
+
+- Batch size: 4
+- Gradient accumulation steps: 4
+- Epochs: 2 in the notebook prototype
+- Precision: FP32
+- Execution: CPU
+- Logging: minimal
+- Save strategy: epoch-based
+
+This is appropriate for 15 GB RAM because it avoids large activation spikes and keeps the adaptation path lightweight.
+
+The production code for this path is in [`incident_triage/train_slm.py`](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\incident_triage\train_slm.py).
+
+### Structured Output Enforcement & Quantization
+The log side of the system is designed to output strict JSON:
+
+```json
+{
+  "error_domain": "DatabaseConnection",
+  "severity": "CRITICAL",
+  "probable_cause": "Connection pool starvation during peak I/O"
+}
+```
+
+The enforcement strategy is:
+
+- Prompt the model to output only JSON.
+- Decode only the generated portion.
+- Extract the first JSON object with regex.
+- Parse with `json.loads`.
+- Fall back to deterministic heuristics if parsing fails.
+
+The parser logic is implemented in [`incident_triage/logs.py`](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\incident_triage\logs.py).
+
+#### Reference parser snippet
+```python
+match = re.search(r"\{[\s\S]*\}", text)
+if match:
+    try:
+        return json.loads(match.group(0))
+    except Exception:
+        pass
+```
+
+Quantization note:
+
+- The current codebase is LoRA-first and CPU-first.
+- Export to INT8 / GGUF / ONNX is a natural next deployment step.
+- The current repository structure supports it, but the shipped code emphasizes training and structured parsing more than a finalized quantization export toolchain.
+
+For a truly locked-down CPU deployment, the recommended next step is:
+
+- Merge LoRA adapters if needed.
+- Quantize the final model.
+- Validate JSON output after quantization.
+- Benchmark latency after export.
+
+---
+
+## 4. Multimodal Fusion & Decision Logic
+
+### Joint Scoring Formulation
+The fusion layer is implemented in [`incident_triage/fusion.py`](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\incident_triage\fusion.py).
+
+The fusion model combines:
+
+- Telemetry anomaly risk \( r_t \)
+- Log severity score \( s_\ell \)
+- Log confidence \( c_\ell \)
+
+The severity mapping is operationalized as:
+
+- LOW = 0.15
+- INFO = 0.25
+- MEDIUM = 0.50
+- HIGH = 0.80
+- CRITICAL = 1.00
+
+The fusion score is:
+
+\[
+F = \text{clip}(w_t r_t + w_\ell (s_\ell c_\ell) + b, 0, 1)
+\]
+
+Where:
+
+- \( w_t = 0.7 \)
+- \( w_\ell = 0.3 \)
+- \( b \) is a small synergy bonus for strong joint evidence
+
+In the current implementation, synergy bonus is added when both telemetry and log evidence are strong.
+
+### Triage Matrix
+The score is mapped to a priority class:
+
+- \( F \ge 0.85 \Rightarrow \) P1
+- \( 0.65 \le F < 0.85 \Rightarrow \) P2
+- \( F < 0.65 \Rightarrow \) P3
+
+A practical triage matrix is:
+
+| Telemetry Risk | Log Severity | Log Confidence | Fused Outcome |
+|---|---:|---:|---|
+| Low | Info | Low | P3 |
+| Medium | Medium | Medium | P3 or P2 |
+| High | High | High | P2 |
+| Very High | Critical | High | P1 |
+
+Routing is then determined by the priority and log domain:
+
+- P1 routes to incident bridge
+- NameSystem issues route to HDFS platform on-call
+- DataNode issues route to storage on-call
+- All others route to general on-call
+
+---
+
+## 5. Experimental Sandbox vs. Production IDE Separation
+
+### Notebooks (`01_signal_and_tabular_proto.ipynb`, `02_slm_lora_sanity_check.ipynb`)
+The notebooks are the experimental sandbox.
+
+Notebook 1:
+
+- Loads telemetry CSV
+- Applies anomaly labeling
+- Builds rolling, EWMA, and FFT features
+- Trains and calibrates the anomaly model
+- Benchmarks latency
+- Simulates live inference
+
+Notebook 2:
+
+- Loads structured HDFS logs
+- Derives heuristic training targets
+- Converts records to chat-style instruction data
+- Initializes a SmolLM2-class model
+- Applies LoRA configuration
+- Tests strict JSON output parsing
+
+These notebooks are not the production engine. They are the lab where the math and workflow were proven.
+
+### Migration Bridge
+The production code now carries notebook logic into modular Python files:
+
+- Notebook feature logic -> [`incident_triage/telemetry.py`](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\incident_triage\telemetry.py)
+- Notebook telemetry training -> [`incident_triage/train_tabular.py`](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\incident_triage\train_tabular.py)
+- Notebook log formatting -> [`incident_triage/logs.py`](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\incident_triage\logs.py)
+- Notebook LoRA training scaffold -> [`incident_triage/train_slm.py`](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\incident_triage\train_slm.py)
+- Notebook parser test -> [`incident_triage/logs.py`](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\incident_triage\logs.py)
+- Notebook end-to-end inference -> [`incident_triage/api/main.py`](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\incident_triage\api\main.py)
+
+This is the correct production ML pattern:
+
+- Notebooks for exploration.
+- Modules for repeatable execution.
+- API for serving.
+- Tests for guardrails.
+- Artifacts for reproducibility.
+
+---
+
+## 6. Codebase Reference & API Specification
+
+### Directory Layout
+Current repository layout:
+
+```text
+Real-Time IT incident triage ML/
+├── data/
+│   ├── cpu_utilization_asg_misconfiguration.csv
+│   └── HDFS_2k.log_structured.csv
+├── notebooks/
+│   ├── 01_signall_and_tabular_proto.ipynb
+│   └── 02_slm_lora_ssanity_check.ipynb
+├── incident_triage/
+│   ├── __init__.py
+│   ├── artifacts.py
+│   ├── benchmark.py
+│   ├── config.py
+│   ├── fusion.py
+│   ├── logs.py
+│   ├── schemas.py
+│   ├── tabular_model.py
+│   ├── telemetry.py
+│   ├── train_slm.py
+│   ├── train_tabular.py
+│   └── api/
+│       ├── __init__.py
+│       └── main.py
+├── tests/
+│   ├── test_fusion.py
+│   ├── test_logs.py
+│   └── test_telemetry.py
+├── Dockerfile
+├── requirements.txt
+├── pyproject.toml
+├── README.md
+├── .gitignore
+└── .dockerignore
+```
+
+### API Endpoint
+The main online inference endpoint is:
+
+- `POST /api/v1/triage`
+
+A health endpoint is also available:
+
+- `GET /health`
+
+### Pydantic Schemas
+The API request and response models are defined in [`incident_triage/schemas.py`](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\incident_triage\schemas.py).
+
+#### Request schema
+```python
+class IncidentRequest(BaseModel):
+    telemetry: TelemetryPayload
+    log_content: Optional[str] = None
+    asset_id: Optional[str] = None
+    source: Optional[str] = None
+```
+
+#### Telemetry payload
+```python
+class TelemetryPayload(BaseModel):
+    values: list[float]
+    timestamps: Optional[list[datetime]] = None
+    metric_name: str = "cpu_utilization"
+```
+
+#### Response schema
+```python
+class TriageResponse(BaseModel):
+    incident_score: float
+    priority: Priority
+    route_to: str
+    explanation: str
+    telemetry: TelemetryRisk
+    log_analysis: Optional[LogAnalysis] = None
+```
+
+### Example cURL Request & JSON Response
+
+#### Request
+```bash
+curl -X POST "http://127.0.0.1:8000/api/v1/triage" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "telemetry": {
+      "values": [32.1, 31.8, 32.4, 33.0, 34.2, 36.5, 41.8, 55.2, 72.4]
+    },
+    "log_content": "PacketResponder 2 for block blk_902318412891 terminating due to socket exception",
+    "asset_id": "host-17",
+    "source": "server-metrics"
+  }'
+```
+
+#### Response
+```json
+{
+  "incident_score": 0.91,
+  "priority": "P1",
+  "route_to": "incident-bridge",
+  "explanation": "Telemetry risk 0.88, log severity HIGH with confidence 0.80 produced fused score 0.91.",
+  "telemetry": {
+    "risk_score": 0.88,
+    "threshold": 0.40,
+    "is_anomaly": true,
+    "probability": 0.88,
+    "feature_snapshot": {
+      "value": 72.4,
+      "rolling_mean_5": 51.22
+    }
+  },
+  "log_analysis": {
+    "error_domain": "HDFS_DataNode",
+    "severity": "HIGH",
+    "probable_cause": "Observed termination, exception, or timeout in the data path",
+    "confidence": 0.8,
+    "raw_text": "PacketResponder 2 for block blk_902318412891 terminating due to socket exception"
+  }
+}
+```
+
+The actual response values depend on the trained telemetry model and the log analyzer path loaded at runtime.
+
+---
+
+## 7. Benchmarks, Profiling & Deployment Guide
+
+### Hardware Profile
+The target machine profile is:
+
+- AMD Ryzen 3 class CPU
+- 4 physical cores
+- 8 logical threads
+- 15 GB RAM
+- CPU-only execution
+- No GPU dependency assumed
+
+This strongly favors:
+
+- compact feature engineering
+- shallow calibrated tree ensembles
+- small SLMs with LoRA
+- low-batch training
+- lightweight web serving
+
+### Target Performance Benchmarks
+The project should be evaluated with the following targets.
+
+#### Telemetry inference
+- P50: sub-5 ms to low tens of ms on a single sample
+- P95: low tens of ms
+- Memory overhead: minimal beyond model load
+
+#### Log parsing and triage
+- JSON extraction and validation should be deterministic and fast.
+- Heuristic fallback should run in negligible time.
+- LoRA inference on CPU will be slower than telemetry scoring, but must remain usable for operational triage.
+
+#### API latency
+For one request containing telemetry plus one log string:
+
+- P50 target: under 100 ms for the telemetry-only path
+- P95 target: under a few hundred ms if log generation is active on CPU
+- The exact number depends heavily on whether the SLM path is loaded and whether generation is performed or replaced by the heuristic fallback
+
+#### Resource bounds
+- RAM: keep under 15 GB total
+- Model artifacts: keep small enough for local deployment
+- Training: CPU-only, no large batch sizes
+- Inference: avoid expensive per-request retraining or repeated model loading
+
+### Docker Deployment
+The repository includes a minimal deployment container in [`Dockerfile`](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\Dockerfile).
+
+#### Container characteristics
+- Base image: `python:3.11-slim`
+- Non-root execution
+- `uvicorn` entrypoint
+- Separate `.dockerignore` to reduce image bloat
+- Artifact directories excluded from image context
+
+#### Build
+```bash
+docker build -t incident-triage-engine .
+```
+
+#### Run
+```bash
+docker run --rm -p 8000:8000 incident-triage-engine
+```
+
+#### Deployment notes
+- If telemetry artifacts are present in `artifacts/`, the API loads them on startup.
+- If model artifacts are absent, the API falls back to heuristic telemetry scoring.
+- This makes the service usable even before full retraining has been completed.
+- For production use, the trained telemetry model and log adapter should be mounted or baked into the image as release artifacts.
+
+---
+
+## Implementation Status Summary
+
+What is currently implemented in the repository:
+
+- Telemetry feature extraction
+- Telemetry anomaly model training path
+- HDFS log target generation
+- Log prompt formatting
+- Structured JSON parsing and heuristic fallback
+- Fusion and routing logic
+- FastAPI triage endpoint
+- Docker deployment skeleton
+- Test coverage for core logic
+
+What remains as the last production-hardening layer:
+
+- Run end-to-end telemetry training and save trained artifacts
+- Run LoRA training if the environment supports the optional ML stack
+- Record real benchmark numbers
+- Add stronger evaluation reports and calibration plots
+- Add model export/quantization if you want a stricter CPU inference deployment
+
+
+
+
+## 1. Executive Summary & Problem Framing
+
+- [Direct Evidence] The repository implements telemetry anomaly detection, HDFS log triage, a fusion decision layer, and a FastAPI service for CPU-first deployment.
+- [Direct Evidence] The telemetry dataset is `data/cpu_utilization_asg_misconfiguration.csv`; the log dataset is `data/HDFS_2k.log_structured.csv`.
+- [Direct Evidence] The runtime stack is explicitly CPU-oriented: `train_slm.py` trains on CPU, `tabular_model.py` limits LightGBM to `n_jobs=4`, and `Dockerfile` uses `python:3.11-slim`.
+- [Engineering Inference] The exact problem solved is asymmetric incident triage under zero-GPU constraints: numerical telemetry is modeled with calibrated tabular ML, while logs are transformed into structured incident JSON with a small-model / heuristic pathway.
+- [Engineering Inference] The main trade-off is reduced modeling expressiveness in exchange for portability, lower memory use, and predictable latency on a Ryzen 3 class machine.
+- [Direct Evidence] The current escalation threshold in code is `P1 >= 0.85`, not `0.75` (`incident_triage/config.py`).
+- [Engineering Inference] If you intended `ITS >= 0.75 -> P1`, the repository is currently stricter than that target.
+
+## 2. Repository Inventory & Module Boundaries
+
+### Conceptual mapping note
+- [Direct Evidence] The repository uses `incident_triage/` rather than a `src/` tree.
+- [Engineering Inference] The table below maps the prompt’s conceptual layers to the actual implementation files.
+
+| Conceptual Layer / Actual Area | Primary Responsibility | Key Files | Dependencies | Dependents | Architectural Tier | Evidence / Note |
+|---|---|---|---|---|---|---|
+| `notebooks/` | Exploration, prototyping, sanity checks | [01_signall_and_tabular_proto.ipynb](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\notebooks\01_signall_and_tabular_proto.ipynb), [02_slm_lora_ssanity_check.ipynb](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\notebooks\02_slm_lora_ssanity_check.ipynb) | pandas, numpy, scipy, lightgbm, sklearn, torch, transformers, peft, datasets | None at runtime | Experimental sandbox | [Direct Evidence] Notebook 1 does labeling, FFT/EWMA, calibrated LightGBM, latency checks; Notebook 2 does HDFS prompt formatting, LoRA setup, JSON parsing. |
+| `data/` | Raw training corpora | `cpu_utilization_asg_misconfiguration.csv`, `HDFS_2k.log_structured.csv` | None | Training notebooks/scripts | Data layer | [Direct Evidence] Only two CSVs are present. |
+| `src/features/` equivalent | Telemetry feature engineering | [incident_triage/telemetry.py](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\incident_triage\telemetry.py) | numpy, pandas, scipy | `tabular_model.py`, `api/main.py`, `benchmark.py`, tests | Feature layer | [Direct Evidence] Implements `TelemetryFeatureExtractor`. |
+| `src/features/` / log preprocessing | Log labeling, prompt building, JSON parsing | [incident_triage/logs.py](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\incident_triage\logs.py) | pandas, json, re, pydantic model types | `train_slm.py`, `api/main.py`, `benchmark.py`, tests | Feature / NLP preprocessing | [Direct Evidence] Implements `HeuristicLogAnalyzer`, `derive_ground_truth`, `extract_json_object`. |
+| `src/models/` equivalent | Tabular anomaly model training and inference | [incident_triage/tabular_model.py](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\incident_triage\tabular_model.py), [incident_triage/train_tabular.py](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\incident_triage\train_tabular.py) | lightgbm, sklearn, numpy, pandas, joblib | `api/main.py`, `benchmark.py`, `README.md` | Model layer | [Direct Evidence] LightGBM or RandomForest fallback plus `CalibratedClassifierCV`. |
+| `src/models/` equivalent | Log SLM dataset prep and optional LoRA training | [incident_triage/train_slm.py](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\incident_triage\train_slm.py) | pandas, datasets, torch, transformers, peft, accelerate | `README.md`, optional artifacts | Model training layer | [Direct Evidence] CPU training path exists; quantization/export is not implemented. |
+| `src/models/` / decision layer | Fusion logic and priority routing | [incident_triage/fusion.py](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\incident_triage\fusion.py) | config, severity scoring | `api/main.py`, tests | Decision layer | [Direct Evidence] `fuse_signals()` computes fused score and route. |
+| `src/app/` equivalent | API serving and runtime orchestration | [incident_triage/api/main.py](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\incident_triage\api\main.py), [incident_triage/schemas.py](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\incident_triage\schemas.py) | FastAPI, Pydantic, local modules | External clients | Runtime serving | [Direct Evidence] `POST /api/v1/triage` and `GET /health`. |
+| `benchmarks/` equivalent | Latency / smoke benchmark script | [incident_triage/benchmark.py](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\incident_triage\benchmark.py) | pandas, numpy, joblib, local modules | Operator / developer workflow | Observability / profiling | [Direct Evidence] Writes benchmark JSON. |
+| Shared infra | Artifact persistence and config | [incident_triage/artifacts.py](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\incident_triage\artifacts.py), [incident_triage/config.py](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\incident_triage\config.py) | joblib, dataclasses, pathlib | Most runtime modules | Infrastructure | [Direct Evidence] `ArtifactManifest` exists; default paths are defined. |
+| Root deployment files | Packaging and deployment | [Dockerfile](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\Dockerfile), [requirements.txt](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\requirements.txt), [pyproject.toml](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\pyproject.toml), [.dockerignore](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\.dockerignore), [.gitignore](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\.gitignore) | Python packaging, Docker | Runtime and CI/CD | Deployment | [Direct Evidence] CPU-only container and dependency list are present. |
+
+## 3. System Mental Model & Data/Control Flow
+
+### High-level walkthrough
+```text
+POST /api/v1/triage
+    -> Pydantic parses IncidentRequest
+    -> RuntimeState supplies cached telemetry model and log analyzer
+    -> Telemetry branch scores recent metric values
+    -> Log branch analyzes raw log string or returns None
+    -> Fusion layer computes incident score and priority
+    -> TriageResponse returned as JSON
+```
+
+### Dual-path lifecycle
+- [Direct Evidence] The telemetry path takes a list of numeric values through `TelemetryFeatureExtractor.extract_from_values()` in [incident_triage/telemetry.py](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\incident_triage\telemetry.py:108).
+- [Direct Evidence] The log path takes a raw string through `HeuristicLogAnalyzer.analyze()` in [incident_triage/logs.py](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\incident_triage\logs.py:124).
+- [Direct Evidence] `triage()` in [incident_triage/api/main.py](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\incident_triage\api\main.py:47) chooses between the cached trained model and a heuristic telemetry fallback.
+- [Engineering Inference] This is an asymmetric control flow: telemetry is treated as a near-real-time numeric stream, while logs are treated as text to be normalized into structured incident semantics.
+- [Direct Evidence] The runtime state is cached in a module-level `RuntimeState` instance, not in an external model registry or database.
+- [Direct Evidence] `startup` loads `artifacts/tabular_model.joblib` if present; if loading fails, the API stays up and falls back to heuristics.
+- [Direct Evidence] The fusion outcome is produced by `fuse_signals()` in [incident_triage/fusion.py](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\incident_triage\fusion.py:39).
+- [Direct Evidence] Current priority thresholds are `0.85` for P1 and `0.65` for P2.
+
+### Request trace with state
+- [Direct Evidence] `state.telemetry_model` is mutated at startup in `load_artifacts()`; request handling itself is otherwise stateless.
+- [Direct Evidence] If a trained model is available, `TelemetryAnomalyModel.predict_from_values()` returns `(probability, is_anomaly, feature_snapshot)` from [incident_triage/tabular_model.py](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\incident_triage\tabular_model.py:136).
+- [Direct Evidence] If no trained model exists, telemetry falls back to `TelemetryFeatureExtractor.heuristic_risk()`.
+- [Direct Evidence] The response body is a `TriageResponse` Pydantic object, so the service guarantees a defined JSON shape.
+
+### Runtime correction to the prompt
+- [Direct Evidence] The current repository does **not** implement parallel LightGBM + ONNX inference in the request path.
+- [Direct Evidence] The current repository does **not** implement an `inference.py` module.
+- [Engineering Inference] The prompt’s “parallel execution” model is a conceptual target, not the shipped runtime.
+
+## 4. Architectural Reverse-Engineering
+
+- [Direct Evidence] Architectural style: hybrid ML pipeline with decoupled extraction, training scripts, and stateless web serving.
+- [Direct Evidence] Offline experimentation is separated into notebooks and `train_*.py` scripts, while runtime serving is handled by `api/main.py`.
+- [Direct Evidence] `TelemetryFeatureExtractor` is a dedicated transformer-like abstraction.
+- [Direct Evidence] `HeuristicLogAnalyzer` is a dedicated log-preprocessing / weak-labeling abstraction.
+- [Direct Evidence] `RuntimeState` is a module-level cached model holder, i.e. a singleton-like runtime engine.
+- [Direct Evidence] `fuse_signals()` is a deterministic rule-weight fusion function, not a learned multimodal gate.
+- [Engineering Inference] The design uses the Feature Transformer pattern, the cached runtime engine pattern, and heuristic fusion because they fit CPU-bound edge deployment better than a larger learned orchestrator.
+- [Direct Evidence] The API route is synchronous (`def triage(...)`), not `async def triage(...)`.
+- [Engineering Inference] FastAPI is used for deployment compatibility and schema validation, but not for event-loop-heavy concurrency in the current code.
+- [Direct Evidence] The code does not contain ONNX export, ONNX Runtime, or INT8 quantization logic.
+
+## 5. Mathematical & Engineering Foundations
+
+### Tabular feature extraction
+- [Direct Evidence] `TelemetryFeatureExtractor` computes rolling mean, std, min, max, range, deviation-from-mean, and z-score features over windows `5`, `15`, and `60`.
+- [Direct Evidence] It also computes EWMA spans `5` and `20`, plus `ewma_delta`.
+- [Direct Evidence] It computes FFT energy over a 30-sample window.
+
+#### EWMA
+For series \(x_t\), the code’s EWMA feature corresponds to:
+\[
+\text{EWMA}_t = \alpha x_t + (1-\alpha)\text{EWMA}_{t-1}, \quad \alpha=\frac{2}{s+1}
+\]
+where \(s\) is the span.
+
+#### FFT spectral energy
+For a windowed segment \(x_0, \dots, x_{n-1}\):
+\[
+X_k = \sum_{j=0}^{n-1} x_j e^{-2\pi i kj/n}
+\]
+\[
+E = \frac{1}{n}\sum_{k=0}^{n-1}|X_k|^2
+\]
+- [Direct Evidence] In code, `_fft_energy()` returns `0.0` for sequences shorter than 4.
+- [Engineering Inference] This protects short sequences from unstable spectral estimates, but it reduces sensitivity on tiny windows.
+
+### Tabular modeling
+- [Direct Evidence] `TelemetryAnomalyModel.train()` uses LightGBM when available; otherwise it falls back to `RandomForestClassifier`.
+- [Direct Evidence] Calibration is performed with `CalibratedClassifierCV`.
+- [Direct Evidence] Production default calibration method is `"sigmoid"`.
+- [Direct Evidence] The notebook prototype first tried isotonic calibration and then a refined sigmoid variant.
+- [Engineering Inference] Sigmoid calibration is likely preferred here because it is often more stable on smaller, noisier CPU datasets than isotonic calibration.
+
+#### Thresholding
+- [Direct Evidence] The decision threshold is chosen by `best_threshold()` using a grid search over `0.05..0.95` with F1 maximization.
+- [Engineering Inference] This is a pragmatic operational threshold rather than a theoretically calibrated Bayes-optimal cutoff.
+
+### NLP, LoRA, and quantization
+- [Direct Evidence] The log SLM training path uses `HuggingFaceTB/SmolLM2-135M-Instruct` by default in [incident_triage/train_slm.py](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\incident_triage\train_slm.py:101).
+- [Direct Evidence] LoRA hyperparameters are `r=8`, `lora_alpha=16`, `lora_dropout=0.05`, target modules `["q_proj", "v_proj"]`.
+- [Direct Evidence] CPU training is explicit: `torch_dtype=torch.float32`, `device_map="cpu"`, `use_cpu=True`, batch size `4`, gradient accumulation `4`, epochs `2`.
+- [Direct Evidence] The repository does not implement ONNX export, INT8 quantization, or AVX2-specific runtime code.
+- [Engineering Inference] The prompt’s quantized ONNX CPU execution path is a future deployment option, not a present capability.
+- [Direct Evidence] Qwen2.5 is not referenced in the shipped code; it appears only in the higher-level vision text, if at all.
+
+#### Concrete code snippet
+```python
+lora_config = LoraConfig(
+    task_type=TaskType.CAUSAL_LM,
+    r=8,
+    lora_alpha=16,
+    lora_dropout=0.05,
+    target_modules=["q_proj", "v_proj"],
+    bias="none",
+)
+```
+
+## 6. Runtime Execution Trace
+
+### Exact trace
+1. [Direct Evidence] `POST /api/v1/triage` is handled in [incident_triage/api/main.py](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\incident_triage\api\main.py:47) by `triage(request: IncidentRequest)`.
+2. [Direct Evidence] FastAPI/Pydantic parses the JSON request into `IncidentRequest` and nested `TelemetryPayload` from [incident_triage/schemas.py](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\incident_triage\schemas.py).
+3. [Direct Evidence] On startup, `load_artifacts()` attempts to load `artifacts/tabular_model.joblib` into `state.telemetry_model`.
+4. [Direct Evidence] If `state.telemetry_model` is present, `predict_from_values()` is called on the numeric telemetry list.
+5. [Direct Evidence] `predict_from_values()` calls `TelemetryFeatureExtractor.extract_from_values()`, then `align_features()`, then `model.predict_proba()`.
+6. [Direct Evidence] The output tuple is `(probability, is_anomaly, feature_snapshot)`.
+7. [Direct Evidence] If no trained model exists, `TelemetryFeatureExtractor.heuristic_risk()` computes a fallback score from the supplied values.
+8. [Direct Evidence] The log branch calls `HeuristicLogAnalyzer.analyze(request.log_content)`.
+9. [Direct Evidence] `HeuristicLogAnalyzer.analyze()` delegates to `heuristic_log_analysis()`, which returns a `LogAnalysis` Pydantic object or `None`.
+10. [Direct Evidence] `fuse_signals()` combines telemetry risk, log severity, log confidence, and log domain into a `FusionResult`.
+11. [Direct Evidence] `TriageResponse` is constructed from the fused result and returned as JSON.
+
+### Runtime state mutations
+- [Direct Evidence] `state.telemetry_model` can change at startup after artifact loading.
+- [Direct Evidence] `state.log_analyzer` and `state.extractor` are instantiated once at module import time.
+- [Direct Evidence] Request handling does not persist additional mutable state.
+
+### Concrete request snippet from the current code path
+```python
+if state.telemetry_model is not None:
+    probability, is_anomaly, feature_snapshot = state.telemetry_model.predict_from_values(telemetry_values)
+else:
+    probability = state.extractor.heuristic_risk(telemetry_values)
+```
+
+## 7. Architecture Decisions & Trade-off Matrix
+
+| Decision | Evidence | Likely Rationale | Alternatives | Trade-offs & Failure Modes | Reconsideration Threshold |
+|---|---|---|---|---|---|
+| Notebook/prod split | [Direct Evidence] `notebooks/` plus `incident_triage/*.py` | [Engineering Inference] Keep exploration isolated from reproducible runtime code | Single monolithic notebook; notebook-only workflow | Easier iteration, harder to accidentally ship prototype code; risk of divergence between notebook and runtime logic | When notebook and package outputs diverge materially or team size grows |
+| Calibrated tree ensemble for telemetry | [Direct Evidence] LightGBM + `CalibratedClassifierCV` in `tabular_model.py` | [Engineering Inference] Good latency/accuracy trade-off on CPU and small tabular datasets | LSTM/Transformer time-series model; deep anomaly detector | Faster and simpler than sequence models; may underperform on long temporal dependencies | When feature engineering saturates and recall remains insufficient |
+| Heuristic log fallback plus optional LoRA prep | [Direct Evidence] `HeuristicLogAnalyzer` and `train_slm.py` | [Engineering Inference] Keep online triage working even if the SLM is unavailable or too heavy | Mandatory online LLM inference; pure rule system | Robust startup and graceful degradation; heuristic rules can misclassify unseen logs | When log quality requirements demand higher semantic fidelity |
+| Cached runtime state | [Direct Evidence] module-level `RuntimeState` in `api/main.py` | [Engineering Inference] Avoid reloading models per request and reduce cold-start overhead | External model server; per-request model loading | Lower latency, but shared-process CPU contention remains | When multi-worker scaling or hot-reload safety becomes critical |
+| Rule-weight fusion | [Direct Evidence] `fuse_signals()` uses weighted sum + synergy bonus | [Engineering Inference] Operational clarity and deterministic escalation | Learned multimodal meta-model | Transparent and debuggable; less adaptive than a learned fusion model | When enough labeled multimodal incidents exist to train a meta-learner |
+| CPU-only deployment | [Direct Evidence] `use_cpu=True`, CPU slim container, `n_jobs=4` | [Engineering Inference] Deployment simplicity and zero-GPU portability | GPU-backed inference or distributed serving | Lower cost and easier portability; higher latency ceiling | When throughput or model complexity outgrows CPU budgets |
+
+## 8. Weaknesses, Technical Debt & Failure Analysis
+
+- [Direct Evidence] There is no ONNX export path, no INT8 quantization, and no AVX2-tuned runtime implementation in the repository.
+- [Direct Evidence] The API route is synchronous, so it can block a Uvicorn worker during CPU-bound inference.
+- [Engineering Inference] If LightGBM uses OpenMP threads, and Uvicorn is also scaled with multiple workers, thread contention can reduce throughput; the repo does not define `OMP_NUM_THREADS` or worker tuning.
+- [Direct Evidence] There are no API integration tests or end-to-end train-serve smoke tests committed, only unit tests for telemetry, logs, and fusion.
+- [Engineering Inference] The telemetry training/serving feature construction is not perfectly symmetric: training uses expanding history over the full series, while runtime inference depends on whatever recent buffer the caller sends.
+- [Direct Evidence] `heuristic_risk()` and `extract_from_values()` depend on the caller-provided buffer length, so short buffers can weaken signal quality.
+- [Direct Evidence] FFT returns `0.0` for sequences shorter than 4, which makes very small windows low-information.
+- [Engineering Inference] The log heuristic rules are keyword-driven, so unfamiliar phrasing, mixed-language logs, or atypical incident text can degrade output quality.
+- [Engineering Inference] The `0.85` P1 threshold is conservative; it lowers false positives but can delay escalation for medium-high incidents.
+- [Direct Evidence] `ArtifactManifest` exists in [incident_triage/artifacts.py](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\incident_triage\artifacts.py) but is not yet wired into a full artifact registry workflow.
+- [Unverified Assumption] If the actual edge environment has tighter memory pressure than 15 GB after dependencies load, the SLM path may become impractical without further quantization.
+
+## 9. Comprehensive Learning Curriculum
+
+| Tier | Concepts | Key Repository Files | Self-Assessment Questions | Hands-on Architectural Refactor Exercise |
+|---|---|---|---|---|
+| Tier 1: Foundations | [Engineering Inference] FFT basics, EWMA, rolling statistics, anomaly labeling, probability calibration, feature leakage | [incident_triage/telemetry.py](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\incident_triage\telemetry.py), [incident_triage/tabular_model.py](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\incident_triage\tabular_model.py), [notebooks/01_signall_and_tabular_proto.ipynb](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\notebooks\01_signall_and_tabular_proto.ipynb) | Can you derive EWMA by hand? Can you explain why calibration matters after a tree model? Can you describe how a rolling window differs from an expanding window? | Refactor rolling-stat and FFT logic into a pure function module with unit tests that compare notebook output against library output on the telemetry CSV. |
+| Tier 2: Intermediate | [Engineering Inference] Prompt formatting for structured JSON, heuristic weak labeling, LoRA adaptation, strict parsing, artifact export | [incident_triage/logs.py](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\incident_triage\logs.py), [incident_triage/train_slm.py](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\incident_triage\train_slm.py), [notebooks/02_slm_lora_ssanity_check.ipynb](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\notebooks/02_slm_lora_ssanity_check.ipynb) | Why is `target_modules=["q_proj","v_proj"]` a reasonable LoRA choice? How do you recover from malformed JSON output? What failure mode does heuristic labeling introduce? | Replace the heuristic-only log analyzer with a pluggable interface that can swap between heuristic rules, trained SLM output, and a mocked test double. |
+| Tier 3: Advanced | [Engineering Inference] CPU inference bottlenecks, worker/thread contention, latency profiling, caching, API state management, graceful fallback | [incident_triage/api/main.py](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\incident_triage\api\main.py), [incident_triage/benchmark.py](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\incident_triage\benchmark.py), [Dockerfile](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\Dockerfile) | What happens when a CPU-bound FastAPI route shares a process with multi-threaded LightGBM? Why is a startup-loaded cached model better than loading per request? What do p50/p95 latency numbers hide? | Add a benchmark harness that compares one-worker vs multi-worker Uvicorn settings and records throughput, tail latency, and memory use into JSON artifacts. |
+| Tier 4: Staff / Architect | [Engineering Inference] Multimodal fusion design, fault isolation, escalation policy, artifact governance, edge MLOps, operational observability | [incident_triage/fusion.py](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\incident_triage\fusion.py), [incident_triage/artifacts.py](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\incident_triage\artifacts.py), [incident_triage/config.py](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\incident_triage\config.py), [README.md](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\README.md) | When should rule-based fusion be replaced with a learned meta-model? What is the operational meaning of P1/P2/P3 thresholds? How would you version models, schemas, and thresholds together? | Introduce a model manifest with explicit versioning, schema hashes, calibration metadata, and a deploy/rollback workflow; then add an integration test that loads the manifest and exercises the whole API path end-to-end. |
+
+
+
+
+
+## 1) System Context Diagram (C4 Level 1)
+```mermaid
+flowchart LR
+  prom["External Monitoring Systems<br/>Prometheus / log shippers"]
+  sre["SRE / On-Call Engineers"]
+  pager["PagerDuty / Slack<br/>(external alert targets)"]
+
+  subgraph engine["Incident Triage Engine boundary<br/>incident_triage/"]
+    api["FastAPI API<br/>incident_triage/api/main.py"]
+    telem["Telemetry path<br/>telemetry.py + tabular_model.py"]
+    logs["Log path<br/>logs.py + train_slm.py"]
+    fuse["Fusion + routing<br/>fusion.py"]
+    api --> telem
+    api --> logs
+    telem --> fuse
+    logs --> fuse
+  end
+
+  prom --> api
+  fuse --> pager
+  pager --> sre
+```
+
+**How to read this diagram:**  
+The external systems feed incident inputs into the FastAPI boundary. The engine splits into telemetry and log analysis, then fuses both into a triage result that is sent to alerting targets and consumed by on-call engineers.
+
+**Key Architectural Insights:**
+- [Direct Evidence] The engine boundary is the `incident_triage` package plus the FastAPI app.
+- [Engineering Inference] Monitoring sources and alert targets are context-level integrations, not implemented adapters in the repo.
+- [Direct Evidence] The repo already contains the triage logic; it does not contain PagerDuty, Slack, or Prometheus connector code.
+
+**Verification Questions:**
+1. Which part of the repo actually owns the triage decision?
+2. Are external monitoring systems producers of payloads, or are they polled by the service?
+3. Does the code currently send alerts to PagerDuty or Slack, or only return JSON responses?
+4. Which objects are still purely external context rather than implemented code?
+
+---
+
+## 2) Container Diagram (C4 Level 2)
+```mermaid
+flowchart TB
+  subgraph docker["Docker container boundary"]
+    subgraph process["Uvicorn server process"]
+      uvicorn["uvicorn<br/>incident_triage.api.main:app"]
+      app["FastAPI application<br/>api/main.py"]
+      state["RuntimeState<br/>cached model + extractor"]
+      artifacts["Memory-cached ML artifacts<br/>artifacts/tabular_model.joblib<br/>artifacts/tabular_feature_columns.json<br/>artifacts/tabular_metrics.json<br/>artifacts/slm_lora_adapter/ optional"]
+      cpu["CPU execution runtime<br/>Python + LightGBM + SciPy"]
+      uvicorn --> app --> state
+      state --> artifacts
+      app --> cpu
+    end
+  end
+```
+
+**How to read this diagram:**  
+The container starts a Uvicorn process that serves the FastAPI app. The app loads and holds model artifacts in memory through `RuntimeState`, then executes inference on the CPU.
+
+**Key Architectural Insights:**
+- [Direct Evidence] The runtime entrypoint is `uvicorn incident_triage.api.main:app`.
+- [Direct Evidence] The current artifact format in the production code is `joblib` plus JSON metadata, not `.pkl` or `.onnx`.
+- [Engineering Inference] The container is intentionally minimal and CPU-only to fit the target hardware.
+
+**Verification Questions:**
+1. What files are loaded into memory on startup?
+2. Is there any ONNX artifact in the current repo?
+3. Is model loading per-request or startup-cached?
+4. Which parts of the container are CPU-bound during inference?
+
+---
+
+## 3) Component Architecture Diagram (C4 Level 3)
+```mermaid
+flowchart LR
+  subgraph pkg["incident_triage package"]
+    subgraph api["api/"]
+      main["main.py"]
+    end
+
+    subgraph feature["feature + log preprocessing"]
+      telemetry["telemetry.py"]
+      logs["logs.py"]
+    end
+
+    subgraph model["model + decision layer"]
+      tabular["tabular_model.py"]
+      fusion["fusion.py"]
+    end
+
+    subgraph shared["shared infra"]
+      schemas["schemas.py"]
+      config["config.py"]
+      artifacts["artifacts.py"]
+    end
+
+    subgraph jobs["training + profiling"]
+      train_tab["train_tabular.py"]
+      train_slm["train_slm.py"]
+      bench["benchmark.py"]
+    end
+
+    main --> schemas
+    main --> telemetry
+    main --> logs
+    main --> fusion
+    main --> tabular
+    main --> config
+    main --> artifacts
+
+    telemetry --> config
+    logs --> schemas
+    tabular --> telemetry
+    tabular --> artifacts
+    fusion --> config
+
+    train_tab --> telemetry
+    train_tab --> tabular
+    train_tab --> config
+
+    train_slm --> logs
+    train_slm --> artifacts
+
+    bench --> telemetry
+    bench --> logs
+    bench --> tabular
+    bench --> artifacts
+  end
+```
+
+**How to read this diagram:**  
+The package is split into shared contracts, feature extraction, model/decision logic, runtime serving, and offline jobs. The arrows show how runtime and training code reuse the same core modules.
+
+**Key Architectural Insights:**
+- [Direct Evidence] `telemetry.py`, `logs.py`, `fusion.py`, and `schemas.py` are the core reusable modules.
+- [Direct Evidence] `train_tabular.py`, `train_slm.py`, and `benchmark.py` are offline utilities, not runtime dependencies.
+- [Engineering Inference] The repo follows a clean “library core, thin execution wrappers” structure.
+
+**Verification Questions:**
+1. Which modules are used by both training and serving?
+2. Which files are runtime-only versus offline-only?
+3. Does the API depend directly on training scripts?
+4. Where are the shared schemas defined?
+
+---
+
+## 4) Module Dependency Graph
+```mermaid
+graph TD
+  api_main["incident_triage.api.main"]
+  telemetry_mod["incident_triage.telemetry"]
+  logs_mod["incident_triage.logs"]
+  fusion_mod["incident_triage.fusion"]
+  tabular_mod["incident_triage.tabular_model"]
+  schemas_mod["incident_triage.schemas"]
+  config_mod["incident_triage.config"]
+  artifacts_mod["incident_triage.artifacts"]
+  train_tab["incident_triage.train_tabular"]
+  train_slm["incident_triage.train_slm"]
+  bench_mod["incident_triage.benchmark"]
+
+  fastapi["fastapi"]
+  numpy["numpy"]
+  pandas["pandas"]
+  scipyfft["scipy.fft"]
+  lightgbm["lightgbm (optional)"]
+  sklearncal["sklearn.calibration"]
+  sklearnens["sklearn.ensemble"]
+  sklearnmet["sklearn.metrics"]
+  sklearnval["sklearn.utils.validation"]
+  joblib["joblib"]
+  pydantic["pydantic"]
+  jsonlib["json"]
+  relib["re"]
+  torch["torch (optional)"]
+  datasets["datasets (optional)"]
+  peft["peft (optional)"]
+  transformers["transformers (optional)"]
+  timepkg["time"]
+
+  api_main --> fastapi
+  api_main --> schemas_mod
+  api_main --> telemetry_mod
+  api_main --> logs_mod
+  api_main --> fusion_mod
+  api_main --> tabular_mod
+  api_main --> config_mod
+  api_main --> artifacts_mod
+
+  telemetry_mod --> numpy
+  telemetry_mod --> pandas
+  telemetry_mod --> scipyfft
+  telemetry_mod --> config_mod
+
+  logs_mod --> jsonlib
+  logs_mod --> relib
+  logs_mod --> pandas
+  logs_mod --> schemas_mod
+
+  fusion_mod --> config_mod
+  fusion_mod --> logs_mod
+
+  tabular_mod --> numpy
+  tabular_mod --> pandas
+  tabular_mod --> sklearncal
+  tabular_mod --> sklearnens
+  tabular_mod --> sklearnmet
+  tabular_mod --> sklearnval
+  tabular_mod --> joblib
+  tabular_mod --> telemetry_mod
+  tabular_mod --> lightgbm
+  tabular_mod --> artifacts_mod
+
+  schemas_mod --> pydantic
+
+  artifacts_mod --> joblib
+
+  train_tab --> pandas
+  train_tab --> telemetry_mod
+  train_tab --> tabular_mod
+  train_tab --> config_mod
+  train_tab --> artifacts_mod
+
+  train_slm --> pandas
+  train_slm --> jsonlib
+  train_slm --> logs_mod
+  train_slm --> artifacts_mod
+  train_slm -. optional .-> torch
+  train_slm -. optional .-> datasets
+  train_slm -. optional .-> peft
+  train_slm -. optional .-> transformers
+
+  bench_mod --> numpy
+  bench_mod --> pandas
+  bench_mod --> timepkg
+  bench_mod --> artifacts_mod
+  bench_mod --> telemetry_mod
+  bench_mod --> logs_mod
+  bench_mod --> tabular_mod
+```
+
+**How to read this diagram:**  
+This is the import graph, not the runtime flow. It shows which Python modules depend on which libraries and which local modules import each other.
+
+**Key Architectural Insights:**
+- [Direct Evidence] SciPy is only used in telemetry feature extraction.
+- [Direct Evidence] LightGBM is optional, not mandatory.
+- [Direct Evidence] ONNX Runtime is not imported anywhere in the current codebase.
+
+**Verification Questions:**
+1. Which modules are the main dependency hubs?
+2. Where is LightGBM optional rather than required?
+3. Does any production file import ONNX Runtime?
+4. Which optional libraries are only used in the SLM training path?
+
+---
+
+## 5) Request & Triage Lifecycle Sequence Diagram
+```mermaid
+sequenceDiagram
+  participant Client
+  participant API as FastAPI / incident_triage.api.main
+  participant Req as IncidentRequest schema
+  participant State as RuntimeState
+  participant Model as TelemetryAnomalyModel
+  participant Extractor as TelemetryFeatureExtractor
+  participant Logs as HeuristicLogAnalyzer
+  participant Fusion as fuse_signals
+
+  Note over API,State: Startup-only path: load_artifacts() tries to load artifacts/tabular_model.joblib
+  API->>State: load_artifacts()
+  alt model artifact exists and loads
+    State->>State: telemetry_model = loaded model
+  else missing or failed load
+    State->>State: telemetry_model = None
+  end
+
+  Note over Client,API: Request path is synchronous, not async in the repo
+  Client->>API: POST /api/v1/triage
+  API->>Req: Parse JSON into Pydantic models
+  Req-->>API: IncidentRequest
+
+  alt trained telemetry model available
+    API->>Model: predict_from_values(values)
+    Model->>Extractor: extract_from_values(values)
+    Extractor-->>Model: feature row
+    Model-->>API: probability, is_anomaly, feature_snapshot
+  else heuristic fallback
+    API->>Extractor: heuristic_risk(values)
+    Extractor-->>API: fallback probability
+  end
+
+  API->>Logs: analyze(log_content)
+  Logs-->>API: LogAnalysis or None
+  API->>Fusion: fuse_signals(risk, severity, confidence, domain)
+  Fusion-->>API: FusionResult
+  API-->>Client: TriageResponse JSON
+```
+
+**How to read this diagram:**  
+The startup path loads the model once. Each request is then handled synchronously: parse input, score telemetry, analyze logs, fuse the signals, and return a typed response.
+
+**Key Architectural Insights:**
+- [Direct Evidence] The route is synchronous in code.
+- [Direct Evidence] The service gracefully degrades to heuristic telemetry scoring when artifacts are missing.
+- [Engineering Inference] This design favors reliability and predictability over maximal concurrency.
+
+**Verification Questions:**
+1. Where does artifact loading happen?
+2. What happens if the trained model cannot be loaded?
+3. Is the request handler async or sync?
+4. Which object produces the final response model?
+
+---
+
+## 6) Data Transformation & Pipeline Flow Diagram
+```mermaid
+flowchart LR
+  subgraph telemetry_path["Telemetry pipeline"]
+    t0["Raw Telemetry Array"]
+    t1["Sliding Window Slices<br/>w = 5, 15, 60"]
+    t2["FFT / EWMA Features<br/>EWMA_t = αx_t + (1-α)EWMA_{t-1}<br/>E_t = Σ|FFT(x)|² / n"]
+    t3["1D Feature Vector"]
+    t4["Anomaly Probability<br/>P_anomaly"]
+    t0 --> t1 --> t2 --> t3 --> t4
+  end
+
+  subgraph log_path["Log pipeline"]
+    l0["Raw Log String"]
+    l1["Prompt Template / Chat Messages"]
+    l2["Token IDs"]
+    l3["CPU SLM Inference<br/>LoRA path; no ONNX export in repo"]
+    l4["Structured JSON Output"]
+    l0 --> l1 --> l2 --> l3 --> l4
+  end
+
+  t4 --> f0
+  l4 --> f0
+
+  f0["Fusion Formula<br/>F = clip(0.7*r_t + 0.3*s_l*c_l + bonus)"]
+  f0 --> out["Final Triage Payload"]
+```
+
+**How to read this diagram:**  
+Telemetry is transformed into a numeric feature vector and anomaly probability. Logs are transformed into a structured JSON incident description. The fusion layer combines both outputs into the final triage payload.
+
+**Key Architectural Insights:**
+- [Direct Evidence] The telemetry path is feature-engineering heavy and model-light.
+- [Direct Evidence] The log path is structured-output heavy and model-optional.
+- [Engineering Inference] ONNX INT8 is not part of the current implementation, so the log branch is still CPU SLM or heuristic oriented.
+
+**Verification Questions:**
+1. Which telemetry transforms are actually implemented?
+2. Does the repository export an ONNX graph?
+3. How is structured JSON enforced on the log side?
+4. What numerical terms feed the fusion formula?
+
+---
+
+## 7) Training vs. Production Artifact Migration Flow
+```mermaid
+flowchart LR
+  nb1["Notebook 1<br/>01_signall_and_tabular_proto.ipynb"]
+  nb2["Notebook 2<br/>02_slm_lora_ssanity_check.ipynb"]
+
+  subgraph prod["Production modules"]
+    telem["incident_triage/telemetry.py"]
+    logs["incident_triage/logs.py"]
+    tabular["incident_triage/tabular_model.py"]
+    train_tab["incident_triage/train_tabular.py"]
+    train_slm["incident_triage/train_slm.py"]
+    api["incident_triage/api/main.py"]
+  end
+
+  subgraph artifacts["Saved artifacts"]
+    art1["artifacts/tabular_model.joblib"]
+    art2["artifacts/tabular_metrics.json"]
+    art3["artifacts/tabular_feature_columns.json"]
+    art4["artifacts/hdfs_sft_dataset.jsonl"]
+    art5["artifacts/hdfs_sft_dataset_preview.json"]
+    art6["artifacts/slm_lora_adapter/ optional"]
+  end
+
+  nb1 --> telem
+  nb1 --> tabular
+  nb1 --> train_tab
+  train_tab --> art1
+  train_tab --> art2
+  train_tab --> art3
+  art1 --> api
+  art3 --> api
+
+  nb2 --> logs
+  nb2 --> train_slm
+  train_slm --> art4
+  train_slm --> art5
+  train_slm --> art6
+  logs --> train_slm
+  art6 --> api
+```
+
+**How to read this diagram:**  
+The notebooks are the experimental source. Their working logic migrates into reusable modules and then into saved artifacts that the API consumes at runtime.
+
+**Key Architectural Insights:**
+- [Direct Evidence] The production code saves `joblib` and JSON artifacts, not `.onnx`.
+- [Direct Evidence] Notebook 1’s telemetry ideas are carried into `telemetry.py` and `train_tabular.py`.
+- [Direct Evidence] Notebook 2’s log formatting and LoRA ideas are carried into `logs.py` and `train_slm.py`.
+
+**Verification Questions:**
+1. Which notebook ideas have been promoted into reusable modules?
+2. Which artifacts are actually created by the training scripts?
+3. Is `.onnx` created anywhere in the repo?
+4. What runtime files depend on the trained artifacts?
+
+---
+
+## 8) Domain Object & Schema Class Diagram
+```mermaid
+classDiagram
+  class TelemetryPayload {
+    +values: list[float]
+    +timestamps: Optional[list[datetime]]
+    +metric_name: str
+  }
+
+  class IncidentRequest {
+    +telemetry: TelemetryPayload
+    +log_content: Optional[str]
+    +asset_id: Optional[str]
+    +source: Optional[str]
+  }
+
+  class TelemetryRisk {
+    +risk_score: float
+    +threshold: float
+    +is_anomaly: bool
+    +probability: float
+    +feature_snapshot: dict[str, float]
+  }
+
+  class Severity {
+    <<enumeration>>
+    LOW
+    INFO
+    MEDIUM
+    HIGH
+    CRITICAL
+  }
+
+  class Priority {
+    <<enumeration>>
+    P3
+    P2
+    P1
+  }
+
+  class LogAnalysis {
+    +error_domain: str
+    +severity: Severity
+    +probable_cause: str
+    +confidence: float
+    +raw_text: Optional[str]
+  }
+
+  class TriageResponse {
+    +incident_score: float
+    +priority: Priority
+    +route_to: str
+    +explanation: str
+    +telemetry: TelemetryRisk
+    +log_analysis: Optional[LogAnalysis]
+  }
+
+  class ArtifactManifest {
+    +tabular_model: Optional[str]
+    +feature_columns: Optional[str]
+    +telemetry_metrics: Optional[str]
+    +slm_dataset: Optional[str]
+    +slm_adapter: Optional[str]
+  }
+
+  IncidentRequest *-- TelemetryPayload
+  TriageResponse *-- TelemetryRisk
+  TriageResponse o-- LogAnalysis
+  LogAnalysis --> Severity
+  TriageResponse --> Priority
+```
+
+**How to read this diagram:**  
+The class diagram shows the API contracts and response composition. `IncidentRequest` is the input envelope, `TriageResponse` is the output envelope, and the nested objects carry telemetry and log semantics.
+
+**Key Architectural Insights:**
+- [Direct Evidence] The actual Pydantic classes are `TelemetryPayload`, `IncidentRequest`, `TelemetryRisk`, `LogAnalysis`, and `TriageResponse`.
+- [Engineering Inference] The conceptual names `IncidentPayload` and `TriageDecision` map cleanly to `IncidentRequest` and `TriageResponse`.
+- [Direct Evidence] `ArtifactManifest` exists as a dataclass, but it is not yet wired into a full manifest workflow.
+
+**Verification Questions:**
+1. Which class is the request envelope?
+2. Which class is the response envelope?
+3. Where are priority and severity encoded?
+4. Is the artifact manifest actively consumed by runtime code?
+
+---
+
+## 9) Concurrency & Thread Allocation Model
+```mermaid
+flowchart TB
+  host["Ryzen 3 host<br/>4 cores / 8 logical threads / 15 GB RAM"]
+
+  subgraph runtime["Process-level execution on the host"]
+    uvicorn["Uvicorn server<br/>single worker by default"]
+    fastapi["FastAPI request handling<br/>sync triage()"]
+    feat["TelemetryFeatureExtractor<br/>Python + SciPy"]
+    lgbm["LightGBM pool<br/>n_jobs=4 / OpenMP threads"]
+    mkl["MKL / BLAS pool<br/>library default, not pinned in repo"]
+    onnx["ONNX Runtime pool<br/>not present in repo"]
+  end
+
+  host --> uvicorn
+  host --> fastapi
+  host --> feat
+  host --> lgbm
+  host --> mkl
+  host --> onnx
+```
+
+**How to read this diagram:**  
+The host has 8 logical threads, but the repository only explicitly configures LightGBM threading. The rest of the pools are implicit or absent.
+
+**Key Architectural Insights:**
+- [Direct Evidence] LightGBM is configured with `n_jobs=4`.
+- [Direct Evidence] There is no explicit `OMP_NUM_THREADS` setting in the repo.
+- [Direct Evidence] ONNX Runtime is not used in the current codebase.
+- [Engineering Inference] The main concurrency risk is thread oversubscription when CPU-bound inference and library thread pools overlap.
+
+**Verification Questions:**
+1. Which thread pool is explicitly configured in code?
+2. Are OpenMP and MKL settings pinned anywhere in the repo?
+3. Does the request path have any async CPU offload?
+4. Is ONNX Runtime part of the runtime topology today?
+
+---
+
+## 10) Edge / Container Deployment Architecture
+```mermaid
+flowchart TB
+  host["Local host hardware<br/>Ryzen 3<br/>4 cores / 8 threads<br/>15 GB RAM"]
+  buildctx["Docker build context<br/>repo files minus .dockerignore exclusions"]
+  docker["Docker Engine"]
+  image["python:3.11-slim image"]
+  user["appuser<br/>non-root runtime user"]
+  env["Container env vars<br/>PYTHONDONTWRITEBYTECODE=1<br/>PYTHONUNBUFFERED=1<br/>PIP_NO_CACHE_DIR=1"]
+  port["Exposed port 8000"]
+  app["uvicorn incident_triage.api.main:app"]
+  artifacts["Runtime artifacts<br/>artifacts/ mounted or baked in"]
+
+  host --> buildctx --> docker --> image --> user --> app
+  env --> image
+  port --> app
+  artifacts --> app
+```
+
+**How to read this diagram:**  
+The host builds a slim Python image, runs the app as a non-root user, exposes port 8000, and optionally mounts or bakes in artifacts for startup loading.
+
+**Key Architectural Insights:**
+- [Direct Evidence] The Dockerfile uses `python:3.11-slim`.
+- [Direct Evidence] The container runs as `appuser`, not root.
+- [Direct Evidence] The app listens on port `8000`.
+- [Engineering Inference] `.dockerignore` is doing important work by excluding caches and artifacts from build context.
+
+**Verification Questions:**
+1. Which environment variables are set in the container?
+2. Does the image require GPU access?
+3. What is the container entrypoint?
+4. Where do runtime artifacts come from at deployment time?
+
+---
+
+
+
+## 1. Feature Scope & Business Logic
+
+### What operational problem does this solve for SRE/DevOps teams?
+- [Direct Evidence] The repository ingests telemetry and logs, then emits a triage decision with priority and routing in [`incident_triage/api/main.py:47`](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\incident_triage\api\main.py:47).
+- [Direct Evidence] Telemetry is modeled from `data/cpu_utilization_asg_misconfiguration.csv`, and logs are derived from `data/HDFS_2k.log_structured.csv`.
+- [Engineering Inference] The operational problem is asymmetric incident triage: one fast numeric signal for anomaly detection, one text signal for root-cause hints, merged into a single response for on-call decision-making.
+- [Engineering Inference] The system is designed to reduce manual context switching for SRE/DevOps teams by converting raw incident evidence into a structured severity/priority/routing payload.
+
+### What are the explicit SLA constraints?
+- [Direct Evidence] The code is CPU-first: `use_cpu=True` in [`incident_triage/train_slm.py:67-78`](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\incident_triage\train_slm.py:67), and LightGBM is bounded with `n_jobs=4` in [`incident_triage/tabular_model.py:23-40`](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\incident_triage\tabular_model.py:23).
+- [Engineering Inference] “Sub-100ms” is a design target, not a hard runtime guarantee in the shipped code. The repository contains a benchmark path, but no enforced latency budget in code.
+- [Direct Evidence] There is no GPU dependency anywhere in the runtime path.
+- [Engineering Inference] The effective SLA goal is low-latency CPU inference with graceful fallback rather than strict real-time hard guarantees.
+
+## 2. Exact Entry Point & Request Ingestion
+
+### File, routing decorator, and function signature
+- [Direct Evidence] Entry point: [`incident_triage/api/main.py:47`](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\incident_triage\api\main.py:47)
+- [Direct Evidence] Routing decorator: `@app.post("/api/v1/triage", response_model=TriageResponse)`
+- [Direct Evidence] Function signature: `def triage(request: IncidentRequest) -> TriageResponse:`
+
+### Pydantic schema validation rules
+- [Direct Evidence] `IncidentRequest` is defined in [`incident_triage/schemas.py:19-23`](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\incident_triage\schemas.py:19).
+- [Direct Evidence] `TelemetryPayload.values` is `list[float]` with `Field(min_length=1)` in [`incident_triage/schemas.py:13-17`](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\incident_triage\schemas.py:13).
+- [Direct Evidence] `TelemetryPayload.timestamps` is optional and typed as `list[datetime]`.
+- [Direct Evidence] `LogAnalysis.severity` and `TriageResponse.priority` are constrained `Literal` values in [`incident_triage/schemas.py:9-10`](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\incident_triage\schemas.py:9).
+- [Direct Evidence] `LogAnalysis.confidence` is bounded to `[0.0, 1.0]` via `Field(ge=0.0, le=1.0)` in [`incident_triage/schemas.py:34-39`](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\incident_triage\schemas.py:34).
+
+### Parsing behavior and memory layout
+- [Direct Evidence] FastAPI/Pydantic parse the incoming JSON into nested model objects, not raw bytes, before handler execution.
+- [Direct Evidence] `request.telemetry.values` becomes a Python list of floats.
+- [Direct Evidence] `request.log_content` remains a Python string or `None`.
+- [Engineering Inference] The hot-path memory layout is lightweight object graphs, then NumPy arrays/DataFrames are created only when telemetry inference runs.
+- [Direct Evidence] Empty telemetry lists are rejected by `if not telemetry_values: raise HTTPException(...)` in [`incident_triage/api/main.py:49-51`](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\incident_triage\api\main.py:49).
+
+## 3. End-to-End Execution Trace
+
+The requested names `transform_stream`, `predict_anomaly`, `parse_log`, and `compute_incident_triage` do **not** exist in the repo. Their actual runtime equivalents are:
+
+- `TelemetryFeatureExtractor.extract_from_values()`
+- `TelemetryAnomalyModel.predict_from_values()`
+- `HeuristicLogAnalyzer.analyze()`
+- `fuse_signals()`
+
+### Trace table
+
+| Step | File & Module | Class / Function | Responsibility | Input Type / Shape | Output Type / Shape | Side Effects / Allocations |
+|---|---|---|---|---|---|---|
+| 1 | [`incident_triage/api/main.py`](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\incident_triage\api\main.py) | `triage(request)` | Ingest request, coordinate pipeline | `IncidentRequest` object | `TriageResponse` object | Allocates validation objects, may raise `HTTPException` |
+| 2 | [`incident_triage/schemas.py`](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\incident_triage\schemas.py) | `IncidentRequest`, `TelemetryPayload` | Validate payload structure and types | Raw JSON | Nested Pydantic models | Creates parsed object graph |
+| 3 | [`incident_triage/api/main.py`](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\incident_triage\api\main.py) | `load_artifacts()` | Load startup telemetry artifact | `artifacts/tabular_model.joblib` path | In-memory model or `None` | Mutates module-level `state.telemetry_model` |
+| 4 | [`incident_triage/tabular_model.py`](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\incident_triage\tabular_model.py) | `TelemetryAnomalyModel.predict_from_values()` | Runtime telemetry scoring | `Iterable[float]` | `(probability, is_anomaly, feature_snapshot)` | Creates feature DataFrame and NumPy-backed inference arrays |
+| 5 | [`incident_triage/telemetry.py`](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\incident_triage\telemetry.py) | `TelemetryFeatureExtractor.extract_from_values()` | Convert raw series into feature row | `Sequence[float]` | `pandas.DataFrame` with one row | Allocates NumPy array, Series, dict, DataFrame |
+| 6 | [`incident_triage/telemetry.py`](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\incident_triage\telemetry.py) | `_fft_energy()` | Compute FFT spectral energy | `np.ndarray` window | `float` | Allocates FFT coeff array |
+| 7 | [`incident_triage/api/main.py`](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\incident_triage\api\main.py) | heuristic fallback branch | Score telemetry if model artifact missing | `list[float]` | `float probability`, `bool anomaly` | No model inference, lower compute cost |
+| 8 | [`incident_triage/logs.py`](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\incident_triage\logs.py) | `HeuristicLogAnalyzer.analyze()` | Derive structured log analysis | `str | None` | `LogAnalysis | None` | Allocates Pydantic `LogAnalysis` when log exists |
+| 9 | [`incident_triage/logs.py`](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\incident_triage\logs.py) | `heuristic_log_analysis()` | Root-cause heuristic classification | Raw log string | `LogAnalysis` | String inspection only, no model weights |
+| 10 | [`incident_triage/fusion.py`](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\incident_triage\fusion.py) | `fuse_signals()` | Combine telemetry and log evidence | scalar risk + log severity/confidence/domain | `FusionResult` | Pure computation, no external I/O |
+| 11 | [`incident_triage/api/main.py`](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\incident_triage\api\main.py) | `TriageResponse(...)` | Serialize final response | `FusionResult`, `TelemetryRisk`, `LogAnalysis` | JSON response payload | Allocates final response model |
+
+### Important clarification
+- [Direct Evidence] There is no live `parse_log()` function.
+- [Direct Evidence] There is no live `ONNX Runtime INT8 forward pass`.
+- [Direct Evidence] The SLM/LoRA code exists in `train_slm.py`, but it is not invoked by `/api/v1/triage`.
+
+## 4. Data Transformation Pipeline
+
+### Raw time-series list -> anomaly probability
+1. [Direct Evidence] Request telemetry arrives as `list[float]` via `TelemetryPayload.values`.
+2. [Direct Evidence] `TelemetryAnomalyModel.predict_from_values()` calls `TelemetryFeatureExtractor.extract_from_values()` in [`incident_triage/tabular_model.py:136-140`](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\incident_triage\tabular_model.py:136).
+3. [Direct Evidence] `extract_from_values()` converts the list to a NumPy array in [`incident_triage/telemetry.py:108-141`](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\incident_triage\telemetry.py:108).
+4. [Direct Evidence] `_fft_energy()` computes spectral energy and returns `0.0` if the buffer has fewer than 4 samples in [`incident_triage/telemetry.py:22-26`](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\incident_triage\telemetry.py:22).
+5. [Direct Evidence] The feature dict is aligned to a fixed feature order and converted into a one-row DataFrame.
+6. [Direct Evidence] The calibrated model returns `predict_proba(...)[:, 1]`.
+
+### Mathematical form
+- [Engineering Inference] FFT energy over a window \(W\) is \(O(W \log W)\) for a single request.
+- [Engineering Inference] The per-request telemetry path is effectively:
+  \[
+  \text{list of floats} \rightarrow \text{NumPy array} \rightarrow \text{feature row} \rightarrow \text{model probability}
+  \]
+
+### Raw string -> structured JSON
+1. [Direct Evidence] The log string enters `HeuristicLogAnalyzer.analyze()` in [`incident_triage/logs.py:124-127`](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\incident_triage\logs.py:124).
+2. [Direct Evidence] `heuristic_log_analysis()` maps keywords to `error_domain`, `severity`, and `probable_cause` in [`incident_triage/logs.py:98-119`](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\incident_triage\logs.py:98).
+3. [Direct Evidence] `extract_json_object()` can parse noisy JSON-like text, but it is not used in the live request path.
+4. [Direct Evidence] The live request path does **not** tokenize into tensors and does **not** run an ONNX graph.
+5. [Engineering Inference] The shipped system keeps the log path deliberately cheap and deterministic; the SLM path is a training scaffold, not runtime inference.
+
+### Numerical scalar + JSON dictionary -> final triage payload
+1. [Direct Evidence] `fuse_signals()` accepts telemetry risk, log severity, log confidence, and log domain in [`incident_triage/fusion.py:39-68`](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\incident_triage\fusion.py:39).
+2. [Direct Evidence] It computes:
+   \[
+   F = \text{clip}(0.7 \cdot r_t + 0.3 \cdot s_\ell c_\ell + \text{synergy})
+   \]
+3. [Direct Evidence] Priority is assigned by thresholds in `FusionConfig`: P1 at `0.85`, P2 at `0.65`, else P3.
+4. [Direct Evidence] `TriageResponse` serializes the final payload.
+
+## 5. Latency & Complexity Profile
+
+### FFT feature extraction
+- [Engineering Inference] Single-window FFT complexity: \(O(W \log W)\).
+- [Engineering Inference] In the training path, `build_training_frame()` computes an FFT value for every row over a sliding window in [`incident_triage/telemetry.py:62-106`](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\incident_triage\telemetry.py:62), so total cost is roughly \(O(N \cdot W \log W)\) for a length-\(N\) series.
+- [Engineering Inference] In live inference, `extract_from_values()` is \(O(W \log W)\) for the user-supplied buffer.
+
+### LightGBM tree evaluation vs. ONNX Transformer attention
+- [Direct Evidence] Current repo uses LightGBM when installed, via `LGBMClassifier` in [`incident_triage/tabular_model.py:23-34`](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\incident_triage\tabular_model.py:23).
+- [Engineering Inference] LightGBM inference is roughly \(O(T \cdot D)\), where \(T\) is number of trees and \(D\) is average depth traversed per tree.
+- [Engineering Inference] A Transformer attention forward pass would be substantially more expensive, typically scaling like \(O(L^2)\) in sequence length \(L\) for attention, before optimizations.
+- [Direct Evidence] The repo does not currently contain ONNX Runtime or Transformer runtime code, so that comparison is hypothetical, not operational.
+
+### Memory allocation profile
+- [Direct Evidence] Telemetry inference allocates:
+  - a NumPy array
+  - a pandas Series
+  - a Python dict
+  - a one-row pandas DataFrame
+- [Direct Evidence] Log inference allocates:
+  - a `LogAnalysis` Pydantic object if the log is present
+- [Engineering Inference] Python GC pressure is moderate per request but can become material under burst traffic because the hot path uses pandas objects rather than pure NumPy structures.
+- [Engineering Inference] The current design favors clarity and reuse over zero-allocation hot-path tuning.
+
+## 6. Edge Cases & Resilience Analysis
+
+### Zero or insufficient telemetry data
+- [Direct Evidence] Empty telemetry arrays are rejected at the API boundary with HTTP 400 in [`incident_triage/api/main.py:49-51`](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\incident_triage\api\main.py:49).
+- [Direct Evidence] `_safe_float_array()` raises on empty or non-finite sequences in [`incident_triage/telemetry.py:13-19`](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\incident_triage\telemetry.py:13).
+- [Direct Evidence] `_fft_energy()` returns `0.0` for buffers smaller than 4 in [`incident_triage/telemetry.py:22-26`](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\incident_triage\telemetry.py:22).
+- [Engineering Inference] Very short telemetry buffers reduce signal quality but will not crash the system unless they are empty or non-finite.
+
+### Corrupted log formats
+- [Direct Evidence] `heuristic_log_analysis()` is keyword-based and can still return a fallback `LogAnalysis` even when the log is messy.
+- [Direct Evidence] `extract_json_object()` attempts regex-based recovery from noisy JSON text in [`incident_triage/logs.py:81-95`](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\incident_triage\logs.py:81).
+- [Engineering Inference] Because live request handling does not depend on an actual SLM parser, malformed logs degrade gracefully rather than causing model decode failures.
+
+### Divergence between modalities
+- [Direct Evidence] Fusion is weighted and thresholded in [`incident_triage/fusion.py:39-68`](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\incident_triage\fusion.py:39).
+- [Engineering Inference] If telemetry flags anomaly but log severity remains INFO/LOW, the fused score may still stay below P1 because log contribution is confidence-weighted and capped.
+- [Engineering Inference] This design intentionally prevents a single weak modality from dominating escalation.
+
+### High request bursts
+- [Direct Evidence] The route is synchronous, not `async def`.
+- [Engineering Inference] Under CPU-bound bursts, a single Uvicorn worker can become a bottleneck because inference runs inside the request thread.
+- [Engineering Inference] LightGBM thread use plus Python object allocation can create throughput pressure if multiple workers and OpenMP threads are not tuned.
+- [Direct Evidence] No background queue, Celery, or worker offload exists in the repo.
+
+## 7. Alternative Architectures & Trade-offs
+
+| Alternative | Complexity | Latency | RAM Footprint | Failure Modes | Comparison to Current Design |
+|---|---|---|---|---|---|
+| Single large multimodal foundation model | High | High on CPU | High | Slow startup, memory pressure, brittleness on edge hardware | More expressive, but mismatched to Ryzen 3 / 15 GB constraints |
+| Pure rule-based regex + z-score detector | Low | Very low | Very low | Lower recall, brittle parsing, weak root-cause generalization | Simpler, but loses calibration and richer telemetry features |
+| Async background queue (Celery/RabbitMQ) | Medium-High | Higher end-to-end, lower request blocking | Medium-High | Queue lag, operational complexity, eventual consistency | Better burst handling, but much more infra than current repo |
+
+### Current design trade-off summary
+- [Direct Evidence] The repository intentionally uses a calibrated tree model for telemetry and heuristics for logs.
+- [Engineering Inference] This is the best fit for local CPU deployment because it keeps latency and operational complexity bounded.
+- [Engineering Inference] The main weakness is limited semantic depth on the log side compared with a full online LLM stack.
+
+## 8. Comprehensive Learning & Mastery Quiz
+
+### Beginner Questions
+1. What file defines the `/api/v1/triage` route?
+2. Which Pydantic class wraps the incoming telemetry list?
+3. What happens if `telemetry.values` is empty?
+4. Where is FFT energy computed?
+5. Which module defines the fusion score?
+6. What file holds the telemetry model training CLI?
+7. Which field constrains severity to a small fixed set?
+8. What is the default telemetry metric name?
+9. Which method converts a raw list into a feature row?
+10. What is the default priority threshold for P1?
+
+### Intermediate Questions
+1. Why is `CalibratedClassifierCV` used after LightGBM?
+2. What does `best_threshold()` optimize?
+3. Why does `_safe_float_array()` reject non-finite values?
+4. Why does `extract_from_values()` use `pandas.DataFrame` even for one row?
+5. What is the role of `target_modules=["q_proj","v_proj"]` in LoRA?
+6. Why is `use_cpu=True` significant?
+7. What is the purpose of `feature_snapshot` in the response?
+8. How does `route_for_priority()` behave for `NameSystem` logs?
+9. Why is `extract_json_object()` separate from `heuristic_log_analysis()`?
+10. Why does the code fall back to heuristic scoring when the model artifact is absent?
+
+### Advanced Architecture Questions
+1. Where can thread oversubscription occur in this repo?
+2. What happens to latency when multiple Uvicorn workers each call a multi-threaded LightGBM model?
+3. Why is synchronous request handling a risk under burst load?
+4. How would you isolate model loading from request-time memory allocation?
+5. Why is a learned multimodal meta-model not used here?
+6. What failure modes arise from keyword-based log classification?
+7. How does the system behave if the telemetry model artifact fails to load?
+8. Why is `ONNX Runtime` absent from the runtime path?
+9. What is the difference between training-time SLM preparation and live inference in this repo?
+10. How would you version the model, feature schema, and fusion threshold together?
+
+### Answer Key
+1. `incident_triage/api/main.py`
+2. `TelemetryPayload`
+3. The API raises HTTP 400.
+4. `incident_triage/telemetry.py` in `_fft_energy()`
+5. `incident_triage/fusion.py`
+6. `incident_triage/train_tabular.py`
+7. `Severity = Literal[...]` in `incident_triage/schemas.py`
+8. `"cpu_utilization"`
+9. `TelemetryFeatureExtractor.extract_from_values()`
+10. `0.85`
+
+11. Calibration makes probability outputs more operationally meaningful.
+12. F1 score over candidate thresholds.
+13. They would corrupt FFT and statistical features.
+14. To preserve a tabular interface compatible with scikit-learn / LightGBM.
+15. To adapt attention projection matrices with low-rank updates.
+16. It prevents GPU assumptions and keeps the stack deployable on edge CPU hardware.
+17. It carries the full telemetry evidence used for the decision.
+18. It maps to `hdfs-platform`.
+19. `extract_json_object()` is a parser helper; `heuristic_log_analysis()` is the live fallback classifier.
+20. To keep the API working even before training artifacts exist.
+
+21. In LightGBM/OpenMP, pandas allocation, and any parallel request workers.
+22. Throughput can drop due to thread contention and cache pressure.
+23. Because CPU work blocks request threads and increases tail latency.
+24. Load once at startup, keep in `RuntimeState`, and reuse.
+25. Because the repo prioritizes edge simplicity and deterministic behavior.
+26. They misclassify unseen phrasing and can be overly sensitive to word choice.
+27. It falls back to heuristic telemetry scoring.
+28. It is not implemented in the current repo.
+29. Training-time SLM code prepares a dataset and optionally fine-tunes; live inference does not invoke it.
+30. Put them in a manifest or artifact registry object and load them atomically.
+
+## 9. Hands-On Architectural Refactoring Challenge
+
+### Challenge
+Add a new telemetry dimension for **Disk I/O Wait anomaly detection** and introduce an **exponential decay factor** on older incident scores, without changing the original trained model weights.
+
+### Target design
+1. Add a new metric field to the telemetry payload and feature extractor.
+2. Extend `TelemetryFeatureExtractor` so it can compute:
+   - rolling disk I/O wait mean/std/min/max
+   - EWMA on disk I/O wait
+   - FFT energy if the new metric is a time series
+3. Keep the existing tabular model weights unchanged.
+4. Add a post-processing decay layer in the fusion path:
+   \[
+   F' = \lambda F_{\text{new}} + (1-\lambda)F_{\text{old}}
+   \]
+   or for age-based decay:
+   \[
+   F_t^{decayed} = F_t \cdot e^{-\gamma \Delta t}
+   \]
+5. Wire the decay into fusion, not into the model weights.
+
+### Where to modify
+- `incident_triage/schemas.py`: extend telemetry payload schema
+- `incident_triage/telemetry.py`: feature extraction
+- `incident_triage/fusion.py`: decay logic
+- `incident_triage/api/main.py`: pass the new metric through the request flow
+- `incident_triage/train_tabular.py`: include the metric in training if the CSV grows to support it
+
+### Verification unit test requirements
+1. A test proving the new metric is accepted by the schema.
+2. A test proving feature extraction returns the new feature columns.
+3. A test proving decay lowers an older score relative to a recent one.
+4. A test proving existing telemetry-only behavior is unchanged when the new metric is absent.
+5. A test proving the API still returns a valid `TriageResponse` when the new metric is included.
+
+### Suggested test cases
+- Empty disk I/O wait series
+- High disk I/O wait spike followed by normalization
+- Two incidents with identical raw score but different ages
+- Mixed telemetry where CPU is normal but disk I/O wait is anomalous
+
+
+
+## 1. Two-Tower Multimodal Architecture vs. Unified End-to-End Deep Learning Model
+
+- **What the repository does:** It uses a split design: telemetry is handled by [`incident_triage/telemetry.py`](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\incident_triage\telemetry.py) and [`incident_triage/tabular_model.py`](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\incident_triage\tabular_model.py), logs are handled by [`incident_triage/logs.py`](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\incident_triage\logs.py), and final decisioning is handled by [`incident_triage/fusion.py`](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\incident_triage\fusion.py). The API orchestrator is [`incident_triage/api/main.py`](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\incident_triage\api\main.py:47).
+- **Evidence in codebase:** `api/main.py` imports `TelemetryFeatureExtractor`, `HeuristicLogAnalyzer`, `TelemetryAnomalyModel`, and `fuse_signals`; `tabular_model.py` uses calibrated LightGBM or RandomForest fallback; `logs.py` uses keyword and JSON heuristics rather than a single multimodal neural backbone.
+- **Why this? (Primary Rationale):** On a Ryzen 3 class CPU, split specialization minimizes compute cost, keeps failure domains independent, and allows each branch to be optimized for its own input type. Telemetry is better served by low-dimensional engineered features; logs are better served by structured extraction or a lightweight SLM. The fusion step stays small and deterministic.
+- **Why not that?**
+  - **Alternative option:** A unified end-to-end multimodal model that takes telemetry sequences and log text jointly.
+  - **Pros & Cons:** Pros: richer cross-modal interactions, potentially better learned latent alignment. Cons: higher memory footprint, more complex training, much larger latency variance, more difficult debugging, and worse CPU-only viability.
+  - **Disqualification reason:** Under 15 GB RAM and no GPU, a unified model is the wrong default unless the dataset is very large and the latency budget is relaxed.
+- **Trade-off Matrix:** Gained: modularity, predictable latency, easier testing, easier fallback handling, independent tuning. Sacrificed: learned cross-modal representation quality and end-to-end semantic fusion.
+- **Failure Conditions:** If incidents depend on subtle interactions between logs and metrics that heuristic fusion cannot express, or if the log side needs deep semantic reasoning beyond keyword/severity extraction.
+- **Scale & Pivot Threshold:** [Engineering inference] Pivot when labeled multimodal incident volume is large enough to train a proper joint model, or when telemetry/log interactions materially improve precision. A practical trigger is sustained throughput above a few hundred requests/sec per host, or when inference quality remains plateaued despite feature engineering.
+- **Staff-Level Comprehension Question:** If telemetry says “severe anomaly” but the log branch says “INFO / routine update,” do you trust the telemetry branch, the log branch, or the fusion score, and why?
+
+## 2. SmolLM2-135M / Qwen2.5-0.5B with INT8 ONNX CPU Execution vs. Local 7B/8B GGUF Model
+
+- **What the repository does:** The training scaffold in [`incident_triage/train_slm.py`](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\incident_triage\train_slm.py:25-91) defaults to `HuggingFaceTB/SmolLM2-135M-Instruct`, applies LoRA, and forces CPU execution with `torch_dtype=torch.float32` and `device_map="cpu"`. The repo does **not** implement ONNX export or INT8 runtime inference.
+- **Evidence in codebase:** `train_slm.py` defines `LoraConfig(r=8, lora_alpha=16, target_modules=["q_proj", "v_proj"])`, uses `Trainer(... use_cpu=True ...)`, and saves adapters with `model.save_pretrained(...)`. `requirements.txt` includes `torch`, `transformers`, `datasets`, `peft`, and `accelerate`, but not `onnxruntime`. `Dockerfile` is CPU-only.
+- **Why this? (Primary Rationale):** A 135M-class model is compatible with a 15 GB RAM edge machine, especially with LoRA and CPU training. It keeps startup and inference costs bounded and avoids the memory spikes of 7B/8B models.
+- **Why not that?**
+  - **Alternative option:** A local 7B/8B GGUF model such as Llama-3-8B.
+  - **Pros & Cons:** Pros: stronger reasoning, better free-form log interpretation, more robust extraction under noisy inputs. Cons: much higher RAM demand, slower CPU decoding, larger KV-cache pressure, and greater latency instability.
+  - **Disqualification reason:** A 7B/8B model is hard to justify on a 4-core / 8-thread CPU if the service is supposed to remain responsive under live triage load.
+- **Trade-off Matrix:** Gained: CPU feasibility, faster fine-tuning, smaller artifact size, lower deployment risk. Sacrificed: reasoning depth, robustness on rare logs, and expressive generation quality.
+- **Failure Conditions:** Long logs, multi-hop root-cause reasoning, very noisy incident narratives, or when generation latency exceeds the operational budget.
+- **Scale & Pivot Threshold:** [Engineering inference] Pivot to larger or more heavily optimized models when you have GPU availability, or when the log task requires materially better semantic extraction than heuristic/135M-class models can provide. A practical trigger is when p95 log-generation latency exceeds your SLA by 2x, or when artifact size plus KV cache cannot fit comfortably in memory with concurrency.
+- **Staff-Level Comprehension Question:** If the SLM branch contributes less than 20 percent of the final triage accuracy but 70 percent of the latency, would you keep it, compress it further, or remove it?
+
+## 3. Sliding Window Signal Processing vs. RNNs / Temporal Transformers
+
+- **What the repository does:** Telemetry is turned into rolling statistics, EWMA, and FFT energy in [`incident_triage/telemetry.py`](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\incident_triage\telemetry.py:43-106). The model then consumes a fixed tabular vector via [`incident_triage/tabular_model.py`](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\incident_triage\tabular_model.py:77-140).
+- **Evidence in codebase:** `window_sizes = (5, 15, 60)`, `ewma_spans = (5, 20)`, `fft_window = 30` in [`incident_triage/config.py`](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\incident_triage\config.py). The feature extractor implements `_fft_energy()`, `rolling`, `ewm`, z-scores, and range features.
+- **Why this? (Primary Rationale):** On CPU, engineered temporal features are cheap, interpretable, and stable. FFT and EWMA provide a good approximation to burstiness, drift, and local oscillation without paying the recurrent or attention cost of a learned temporal model.
+- **Why not that?**
+  - **Alternative option:** LSTM, GRU, or temporal transformers such as PatchTST.
+  - **Pros & Cons:** Pros: can model long-range dependencies, learns features automatically, may outperform manual transforms if enough data exists. Cons: more training complexity, heavier inference, larger memory bandwidth use, more difficult calibration, and less transparency.
+  - **Disqualification reason:** For a small telemetry dataset on CPU, deep temporal models are usually overkill and are more likely to become latency-bound than accuracy-bound.
+- **Trade-off Matrix:** Gained: low latency, deterministic memory, simple debugging, excellent portability. Sacrificed: learned long-context temporal semantics and end-to-end feature discovery.
+- **Failure Conditions:** Strong seasonality over long windows, complex multivariate dependencies, or nonstationary patterns that engineered features fail to capture.
+- **Scale & Pivot Threshold:** [Engineering inference] Pivot when your telemetry is genuinely multivariate, sequence length is large, and labeled anomalies are plentiful. A practical trigger is when rolling features saturate and sequence-aware models deliver measurable validation uplift at acceptable latency.
+- **Staff-Level Comprehension Question:** What error mode appears if the anomaly is a slow drift over 6 hours rather than a short spike?
+
+## 4. Direct In-Memory Model Cache within FastAPI vs. Microservice Split with Redis/Triton
+
+- **What the repository does:** The API keeps a module-level `RuntimeState` in [`incident_triage/api/main.py`](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\incident_triage\api\main.py:20-26), loads artifacts at startup in `load_artifacts()`, and reuses the cached model on every request.
+- **Evidence in codebase:** `state.telemetry_model` is set during startup in [`incident_triage/api/main.py:29-36`](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\incident_triage\api\main.py:29). There is no Redis client, no Triton client, no RPC layer, and no background queue.
+- **Why this? (Primary Rationale):** In-process caching minimizes network hops, serialization overhead, and deployment complexity. It is the fastest path to CPU-friendly inference on a single host.
+- **Why not that?**
+  - **Alternative option:** Split telemetry, log inference, and fusion into separate services with Redis or Triton as a model server.
+  - **Pros & Cons:** Pros: independent scaling, isolation, model hot-swaps, and clearer service boundaries. Cons: more operational complexity, more network latency, more failure points, and more deployment overhead.
+  - **Disqualification reason:** A microservice split is hard to justify until the single-process design hits throughput or reliability limits that are actually caused by process co-location.
+- **Trade-off Matrix:** Gained: low latency, simpler deployment, fewer moving parts. Sacrificed: horizontal scalability, independent lifecycle management, and fault isolation between model components.
+- **Failure Conditions:** High QPS, multiple models competing for CPU, long startup time, or the need to scale telemetry and log inference independently.
+- **Scale & Pivot Threshold:** [Engineering inference] Pivot when one host no longer handles your concurrency target, or when model warm-up and request latency begin to compete for CPU. A practical trigger is sustained worker saturation above ~80-85 percent and tail latency violations under burst traffic.
+- **Staff-Level Comprehension Question:** When would you prefer network isolation over in-process latency, even if the deployment becomes 2-3x more complex?
+
+## 5. Calibrated Classifier vs. Raw Tree Ensemble Output Probabilities
+
+- **What the repository does:** `TelemetryAnomalyModel.train()` wraps the base estimator in `CalibratedClassifierCV` in [`incident_triage/tabular_model.py`](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\incident_triage\tabular_model.py:43-47, 97-105). It then searches for an operational threshold with `best_threshold()`.
+- **Evidence in codebase:** `CalibratedClassifierCV(estimator=estimator, method=calibration_method, cv=3)` is explicit in [`incident_triage/tabular_model.py:43-47`](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\incident_triage\tabular_model.py:43). The default method is `"sigmoid"` in `train()`.
+- **Why this? (Primary Rationale):** Raw tree probabilities are often poorly calibrated. In an incident system, a “0.87” must mean something operationally meaningful, because thresholding drives escalation and routing.
+- **Why not that?**
+  - **Alternative option:** Use raw LightGBM probabilities directly.
+  - **Pros & Cons:** Pros: simpler, faster, less fit-time overhead. Cons: less reliable probability semantics, more threshold instability, and poor generalization under class imbalance or shift.
+  - **Disqualification reason:** If the output probability is used for escalation, a poorly calibrated score is a safety and reliability problem.
+- **Trade-off Matrix:** Gained: better risk interpretation, more stable thresholds, better operator trust. Sacrificed: a bit of training complexity and some fit-time overhead.
+- **Failure Conditions:** Extremely small calibration sets, highly nonstationary drift, or calibration mismatch between training and production incidents.
+- **Scale & Pivot Threshold:** [Engineering inference] Pivot away from `CalibratedClassifierCV` only when you have large, stable training data and can demonstrate that raw scores are already well-calibrated and cheaper to maintain.
+- **Staff-Level Comprehension Question:** If two models have the same ROC-AUC but one is badly calibrated, which one is safer for paging logic and why?
+
+## 6. Heuristic Weighted Fusion vs. Learned Stacking Meta-Classifier
+
+- **What the repository does:** The final score is computed by `fuse_signals()` in [`incident_triage/fusion.py`](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\incident_triage\fusion.py:39-68), using a weighted sum plus a small synergy bonus. Priority is assigned by fixed thresholds from `FusionConfig`.
+- **Evidence in codebase:** `telemetry_weight = 0.7`, `log_weight = 0.3`, `p1_threshold = 0.85`, `p2_threshold = 0.65`, `p3_threshold = 0.45` in [`incident_triage/config.py`](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\incident_triage\config.py:21-29). `fuse_signals()` adds a synergy bonus only when both signals are strong.
+- **Why this? (Primary Rationale):** A deterministic heuristic fusion layer is transparent, cheap, and easy to reason about. It is also usable without a large labeled multimodal incident dataset.
+- **Why not that?**
+  - **Alternative option:** A learned stacking meta-classifier trained on telemetry probability, log severity embeddings, and confidence features.
+  - **Pros & Cons:** Pros: can learn nonlinear interactions, better fit to data if enough examples exist. Cons: requires labeled multimodal incidents, introduces another model to calibrate and monitor, and can overfit small datasets.
+  - **Disqualification reason:** The repo does not currently have enough verified multimodal incident pairs to justify a learned stacker as the default.
+- **Trade-off Matrix:** Gained: explainability, maintainability, deterministic escalation. Sacrificed: adaptive nonlinear fusion and potentially higher peak accuracy.
+- **Failure Conditions:** When modality interactions are non-additive, when business policy changes frequently, or when you have enough incident labels to justify meta-learning.
+- **Scale & Pivot Threshold:** [Engineering inference] Pivot when you have at least low-thousands of well-labeled multimodal incidents and the heuristic fusion no longer improves precision/recall after several weight sweeps.
+- **Staff-Level Comprehension Question:** If a learned stacker beats the heuristic by 2 percent AUC but doubles operational complexity, would you ship it?
+
+## 7. Multi-Thread Pinning vs. Unbounded Default Thread Pools
+
+- **What the repository does:** The repo explicitly sets `n_jobs=4` for LightGBM in [`incident_triage/tabular_model.py:23-34`](C:\Users\aseem\OneDrive\Dokumen\Realtime IT incident triage ML\incident_triage\tabular_model.py:23) and uses CPU training in `train_slm.py`. It does **not** define `OMP_NUM_THREADS`, `MKL_NUM_THREADS`, or similar runtime pinning in the codebase or Dockerfile.
+- **Evidence in codebase:** `LGBMClassifier(... n_jobs=n_jobs ...)` is explicit; `Dockerfile` is minimal and lacks OpenMP/MKL environment controls; `requirements.txt` and Python modules contain no thread-pinning setup.
+- **Why this? (Primary Rationale):** Partial pinning via `n_jobs=4` is a pragmatic compromise: it limits the most obvious source of CPU oversubscription without over-constraining the environment. That said, it is not a full thread-control strategy.
+- **Why not that?**
+  - **Alternative option:** Leave all thread pools unbounded and let each library auto-tune.
+  - **Pros & Cons:** Pros: maximum convenience, sometimes better throughput in single-model toy runs. Cons: oversubscription, tail-latency spikes, cache thrash, and unpredictability under concurrent requests.
+  - **Disqualification reason:** On an 8-thread CPU, unbounded pools can easily collapse performance once Uvicorn, LightGBM, NumPy/SciPy, and any future ONNX runtime all compete for cores.
+- **Trade-off Matrix:** Gained: a baseline cap on compute usage, less obvious oversubscription from LightGBM. Sacrificed: full control, reproducible CPU scheduling, and predictable multi-library concurrency.
+- **Failure Conditions:** Concurrent requests, multiple Uvicorn workers, any future ONNX/MKL-heavy branch, or workloads with repeated FFT/model evaluations.
+- **Scale & Pivot Threshold:** [Engineering inference] You need explicit thread pinning when you move beyond one worker and one model, or when p95 latency becomes unstable under burst load. A practical trigger is CPU utilization above ~85 percent with rising tail latency.
+- **Staff-Level Comprehension Question:** Why can “4 threads everywhere” still be worse than explicit pinning of OpenMP, BLAS, and web workers to disjoint budgets?
+

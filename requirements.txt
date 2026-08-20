@@ -1,0 +1,19 @@
+numpy
+pandas
+scipy
+scikit-learn
+joblib
+lightgbm
+fastapi
+uvicorn
+pydantic
+pytest
+
+# Optional ML stack for the LoRA notebook/script
+torch
+transformers
+datasets
+peft
+accelerate
+trl
+
