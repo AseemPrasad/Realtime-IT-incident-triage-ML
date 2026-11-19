@@ -19,15 +19,20 @@ SYSTEM_PROMPT = (
 def normalize_severity(level: str) -> str:
     level = (level or "").upper()
     mapping = {
+        "LOW": "LOW",
         "TRACE": "LOW",
         "DEBUG": "LOW",
         "INFO": "INFO",
         "WARN": "MEDIUM",
         "WARNING": "MEDIUM",
+        "MEDIUM": "MEDIUM",
+        "HIGH": "HIGH",
         "ERROR": "HIGH",
+        "CRITICAL": "CRITICAL",
         "FATAL": "CRITICAL",
     }
     return mapping.get(level, "MEDIUM")
+
 
 
 def severity_score(severity: str) -> float:
@@ -95,6 +100,58 @@ def extract_json_object(text: str) -> dict[str, Any] | None:
     return None
 
 
+def generate_structured_log_analysis(
+    generator_or_model: Any,
+    log_content: str,
+    tokenizer: Any | None = None,
+) -> LogAnalysis:
+    """Production-grade constrained structured log inference.
+    
+    Level 1: If an Outlines / Guided generation callable is provided, executes logit-masked generation.
+    Level 2: Strict JSON parsing and schema validation if raw generation text is returned.
+    Level 3: Deterministic heuristic fallback to ensure 0% API exception rate.
+    """
+    if not log_content:
+        return LogAnalysis(
+            error_domain="UNKNOWN",
+            severity="INFO",
+            probable_cause="Empty log content",
+            confidence=0.0,
+        )
+
+    # Level 1: Outlines generator callable
+    if callable(generator_or_model):
+        try:
+            res = generator_or_model(log_content)
+            if isinstance(res, LogAnalysis):
+                return res
+            if isinstance(res, dict):
+                return LogAnalysis(**res)
+        except Exception:
+            pass
+
+    # Level 2: Text output parsing
+    raw_text = str(generator_or_model)
+    parsed = extract_json_object(raw_text)
+    if parsed and isinstance(parsed, dict):
+        try:
+            domain = str(parsed.get("error_domain", "HDFS_Runtime"))
+            severity = normalize_severity(parsed.get("severity", "MEDIUM"))
+            cause = str(parsed.get("probable_cause", "Incident anomaly detected"))
+            return LogAnalysis(
+                error_domain=domain,
+                severity=severity,  # type: ignore[arg-type]
+                probable_cause=cause,
+                confidence=severity_score(severity),
+                raw_text=log_content,
+            )
+        except Exception:
+            pass
+
+    # Level 3: Deterministic fallback
+    return heuristic_log_analysis(log_content)
+
+
 def heuristic_log_analysis(log_content: str) -> LogAnalysis:
     lower = (log_content or "").lower()
     if any(token in lower for token in ["terminating", "failure", "timeout", "exception", "error"]):
@@ -129,11 +186,22 @@ class HeuristicLogAnalyzer:
     def build_prompt(self, log_content: str) -> list[dict[str, str]]:
         return build_chat_messages(log_content)
 
-    def training_rows(self, frame: pd.DataFrame, limit: int | None = None) -> list[dict[str, Any]]:
+    def training_rows(
+        self,
+        frame: pd.DataFrame,
+        limit: int | None = None,
+        teacher_annotator: Any | None = None,
+    ) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
         selected = frame.head(limit) if limit else frame
         for _, row in selected.iterrows():
-            target = derive_ground_truth(row)
-            rows.append({"messages": build_chat_messages(str(row.get("Content", "")), target)})
+            content = str(row.get("Content", ""))
+            # If a teacher model/annotator is provided, use it for distillation ground-truth
+            if teacher_annotator is not None and hasattr(teacher_annotator, "annotate"):
+                target = teacher_annotator.annotate(row)
+            else:
+                target = derive_ground_truth(row)
+            rows.append({"messages": build_chat_messages(content, target)})
         return rows
+
 

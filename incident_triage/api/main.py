@@ -1,26 +1,49 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Security, status
+from fastapi.security import APIKeyHeader
 
 from ..artifacts import load_joblib
 from ..config import ARTIFACT_DIR, DEFAULT_FUSION_CONFIG
+from ..drift import TelemetryDriftMonitor
 from ..fusion import fuse_signals
 from ..logs import HeuristicLogAnalyzer
 from ..schemas import IncidentRequest, LogAnalysis, TelemetryRisk, TriageResponse
+from ..stream_buffer import StreamBufferProtocol, create_stream_buffer
 from ..tabular_model import TelemetryAnomalyModel
 from ..telemetry import TelemetryFeatureExtractor
 
 
 app = FastAPI(title="Real-Time IT Incident Triage Engine", version="0.1.0")
 
+# Security & Auth guardrails:
+# If API_KEY is set in environment, enforces X-API-Key header.
+# If not set (local dev / tests), access is automatically permitted with zero breaking changes.
+api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+
+def verify_api_key(api_key: Optional[str] = Security(api_key_header)) -> Optional[str]:
+    expected_key = os.getenv("API_KEY")
+    if expected_key:
+        if not api_key or api_key != expected_key:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid or missing API Key. Provide a valid 'X-API-Key' header.",
+            )
+    return api_key
+
+
 
 class RuntimeState:
     telemetry_model: Optional[TelemetryAnomalyModel] = None
     log_analyzer: HeuristicLogAnalyzer = HeuristicLogAnalyzer()
     extractor: TelemetryFeatureExtractor = TelemetryFeatureExtractor()
+    stream_buffer: StreamBufferProtocol = create_stream_buffer(maxlen=30)
+    drift_monitor: TelemetryDriftMonitor = TelemetryDriftMonitor()
 
 
 state = RuntimeState()
@@ -37,18 +60,33 @@ def load_artifacts() -> None:
 
 
 @app.get("/health")
-def health() -> dict[str, str]:
+def health() -> dict[str, object]:
     return {
         "status": "ok",
         "telemetry_model": "loaded" if state.telemetry_model else "heuristic",
+        "buffer_backend": type(state.stream_buffer).__name__,
     }
 
 
-@app.post("/api/v1/triage", response_model=TriageResponse)
+@app.get("/health/drift")
+def drift_status() -> dict[str, object]:
+    # Check drift on the default buffer if values exist
+    recent_vals = state.stream_buffer.get_window("default")
+    return state.drift_monitor.assess_drift(recent_vals)
+
+
+@app.post("/api/v1/triage", response_model=TriageResponse, dependencies=[Depends(verify_api_key)])
 def triage(request: IncidentRequest) -> TriageResponse:
     telemetry_values = request.telemetry.values
     if not telemetry_values:
-        raise HTTPException(status_code=400, detail="telemetry.values must contain at least one value")
+        if request.telemetry.value is not None:
+            entity_key = request.asset_id or request.source or "default"
+            telemetry_values = state.stream_buffer.record_and_get_window(entity_key, request.telemetry.value)
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail="Either telemetry.values (historical list) or telemetry.value (streaming single point) must be provided",
+            )
 
     if state.telemetry_model is not None:
         probability, is_anomaly, feature_snapshot = state.telemetry_model.predict_from_values(telemetry_values)

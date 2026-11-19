@@ -11,16 +11,22 @@ Priority = Literal["P3", "P2", "P1"]
 
 
 class TelemetryPayload(BaseModel):
-    values: list[float] = Field(min_length=1)
+    values: Optional[list[float]] = None
+    value: Optional[float] = None
     timestamps: Optional[list[datetime]] = None
     metric_name: str = "cpu_utilization"
 
 
 class IncidentRequest(BaseModel):
     telemetry: TelemetryPayload
-    log_content: Optional[str] = None
+    log_content: Optional[str] = Field(
+        default=None,
+        max_length=10_000,
+        description="Raw log content up to 10KB to protect against payload flooding / DoS",
+    )
     asset_id: Optional[str] = None
     source: Optional[str] = None
+
 
 
 class TelemetryRisk(BaseModel):

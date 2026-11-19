@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any, Protocol, runtime_checkable
 
 from .config import FusionConfig
 from .logs import severity_score
@@ -12,6 +13,20 @@ class FusionResult:
     priority: str
     route_to: str
     explanation: str
+
+
+@runtime_checkable
+class FusionModelProtocol(Protocol):
+    """Protocol for learned fusion meta-models."""
+
+    def predict_fusion(
+        self,
+        telemetry_risk: float,
+        log_severity: str | None = None,
+        log_confidence: float = 0.0,
+        config: FusionConfig = FusionConfig(),
+        log_domain: str | None = None,
+    ) -> FusionResult: ...
 
 
 def _clamp(value: float) -> float:
@@ -42,7 +57,18 @@ def fuse_signals(
     log_confidence: float = 0.0,
     config: FusionConfig = FusionConfig(),
     log_domain: str | None = None,
+    model: FusionModelProtocol | Any | None = None,
 ) -> FusionResult:
+    # If a trained/learned meta-model is provided, delegate to it
+    if model is not None and hasattr(model, "predict_fusion"):
+        return model.predict_fusion(
+            telemetry_risk=telemetry_risk,
+            log_severity=log_severity,
+            log_confidence=log_confidence,
+            config=config,
+            log_domain=log_domain,
+        )
+
     telemetry_risk = _clamp(telemetry_risk)
     severity_component = severity_score(log_severity or "INFO") * _clamp(log_confidence)
     synergy_bonus = 0.0
@@ -66,4 +92,5 @@ def fuse_signals(
         route_to=route,
         explanation=explanation,
     )
+
 

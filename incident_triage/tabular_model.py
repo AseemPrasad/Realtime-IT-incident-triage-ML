@@ -90,19 +90,31 @@ class TelemetryAnomalyModel:
         y = frame.sort_values(extractor.config.timestamp_col).reset_index(drop=True)[label_col].astype(int)
         X = extractor.align_features(features)
 
-        split_idx = int(len(X) * 0.8)
-        X_train, X_test = X.iloc[:split_idx], X.iloc[split_idx:]
-        y_train, y_test = y.iloc[:split_idx], y.iloc[split_idx:]
+        # 3-way temporal split: 60% Train, 20% Calibration & Threshold Tuning, 20% Test Holdout
+        # This completely resolves threshold optimization & calibration leakage on train data.
+        n = len(X)
+        idx_train = int(n * 0.6)
+        idx_tune = int(n * 0.8)
+
+        X_train, y_train = X.iloc[:idx_train], y.iloc[:idx_train]
+        X_tune, y_tune = X.iloc[idx_train:idx_tune], y.iloc[idx_train:idx_tune]
+        X_test, y_test = X.iloc[idx_tune:], y.iloc[idx_tune:]
 
         estimator = _build_estimator(random_state=random_state, n_jobs=n_jobs)
-        calibrator = _make_calibrator(estimator, method=calibration_method, cv=3)
-        calibrator.fit(X_train, y_train)
-
-        valid_split = max(1, int(len(X_train) * 0.2))
-        X_threshold = X_train.iloc[-valid_split:]
-        y_threshold = y_train.iloc[-valid_split:]
-        threshold_proba = calibrator.predict_proba(X_threshold)[:, 1]
-        threshold = best_threshold(y_threshold.to_numpy(), threshold_proba)
+        # If tuning set has at least 2 classes and enough samples, fit estimator on train and calibrate on tune (cv="prefit")
+        if len(np.unique(y_tune)) > 1 and len(y_tune) >= 10:
+            estimator.fit(X_train, y_train)
+            calibrator = _make_calibrator(estimator, method=calibration_method, cv="prefit")
+            calibrator.fit(X_tune, y_tune)
+            threshold_proba = calibrator.predict_proba(X_tune)[:, 1]
+            threshold = best_threshold(y_tune.to_numpy(), threshold_proba)
+        else:
+            # Fallback for very small datasets: standard calibrated CV on train
+            calibrator = _make_calibrator(estimator, method=calibration_method, cv=3)
+            calibrator.fit(X_train, y_train)
+            threshold_proba = calibrator.predict_proba(X_tune)[:, 1] if len(X_tune) > 0 else calibrator.predict_proba(X_train)[:, 1]
+            y_thresh_arr = y_tune.to_numpy() if len(X_tune) > 0 else y_train.to_numpy()
+            threshold = best_threshold(y_thresh_arr, threshold_proba)
 
         test_proba = calibrator.predict_proba(X_test)[:, 1]
         test_pred = (test_proba >= threshold).astype(int)
@@ -111,6 +123,7 @@ class TelemetryAnomalyModel:
             "threshold": float(threshold),
             "classification_report": classification_report(y_test, test_pred, output_dict=True, zero_division=0),
             "train_rows": int(len(X_train)),
+            "tune_rows": int(len(X_tune)),
             "test_rows": int(len(X_test)),
         }
         return cls(

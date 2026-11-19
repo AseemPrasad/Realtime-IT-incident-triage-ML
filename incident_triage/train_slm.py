@@ -10,9 +10,13 @@ from .artifacts import ensure_dir, dump_json
 from .logs import HeuristicLogAnalyzer, build_chat_messages, derive_ground_truth
 
 
-def build_dataset(frame: pd.DataFrame, limit: int | None = None) -> list[dict]:
+def build_dataset(
+    frame: pd.DataFrame,
+    limit: int | None = None,
+    teacher_annotator: Any | None = None,
+) -> list[dict]:
     analyzer = HeuristicLogAnalyzer()
-    return analyzer.training_rows(frame, limit=limit)
+    return analyzer.training_rows(frame, limit=limit, teacher_annotator=teacher_annotator)
 
 
 def export_jsonl(rows: list[dict], path: Path) -> None:
